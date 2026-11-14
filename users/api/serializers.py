@@ -14,6 +14,8 @@ class ProfileSerializer(serializers.ModelSerializer):
     country = CountryField(allow_blank=True)
     fast_avatar = serializers.SerializerMethodField()
     is_online = serializers.SerializerMethodField()
+    # Server-computed daily search quota (used / limit / remaining) — the dashboard shows this
+    quota = serializers.SerializerMethodField()
 
     class Meta:
         model = Profile
@@ -28,7 +30,7 @@ class ProfileSerializer(serializers.ModelSerializer):
             'persona_image_url', 'fast_avatar', 'trust_score', 'trust_tier',
             'subscription_tier', 'is_premium', 'subscription_expiry',
             'daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches',
-            'is_online',
+            'is_online', 'quota',
         ]
         # SECURITY: anything that is paid for, earned, or computed by the server must be read-only.
         # Previously subscription_tier / subscription_expiry / quotas were writable via PATCH = free premium.
@@ -45,8 +47,12 @@ class ProfileSerializer(serializers.ModelSerializer):
         'latitude', 'longitude', 'subscription_tier', 'is_premium', 'subscription_expiry',
         'daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches',
         'diamonds', 'current_intent', 'hidden_data_fields', 'connection_preferences',
-        'self_reported_traits',
+        'self_reported_traits', 'quota',
     )
+
+    def get_quota(self, instance):
+        from users import quota
+        return quota.summary(instance)
 
     def get_is_online(self, instance):
         return instance.is_online()

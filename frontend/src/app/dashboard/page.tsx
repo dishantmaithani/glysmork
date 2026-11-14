@@ -10,6 +10,57 @@ import { useNotification } from '@/components/NotificationProvider';
 import { useCall } from '@/components/CallProvider';
 import LocationPicker from '@/components/LocationPicker';
 
+// ── Daily search quota display ────────────────────────────────────────────────
+// Numbers come from the server (`profile.quota`, see users/quota.py) so the limits,
+// the daily reset and premium status always match what the backend enforces.
+type QuotaItem = { used: number; limit: number | null; remaining: number | null };
+type Quota = { is_premium: boolean; ai: QuotaItem; standard: QuotaItem; roulette: QuotaItem };
+
+function getQuota(profile: any): Quota | null {
+    if (!profile) return null;
+    if (profile.quota) return profile.quota as Quota;
+    // Fallback for an older API that doesn't send `quota` yet
+    const prem = profile.is_premium === true;
+    const mk = (used: number, limit: number | null): QuotaItem =>
+        ({ used, limit, remaining: limit === null ? null : Math.max(0, limit - used) });
+    return {
+        is_premium: prem,
+        ai: mk(profile.daily_ai_llm_searches || 0, prem ? 40 : 4),
+        standard: mk(profile.daily_standard_searches || 0, prem ? 100 : 4),
+        roulette: mk(profile.daily_roulette_searches || 0, prem ? null : 20),
+    };
+}
+
+function QuotaRow({ label, item, barClass, compact }: { label: string; item: QuotaItem; barClass: string; compact: boolean }) {
+    const unlimited = item.limit === null;
+    const pct = unlimited ? 100 : Math.max(0, Math.min(100, ((item.remaining ?? 0) / (item.limit || 1)) * 100));
+    return (
+        <div className={compact ? 'space-y-1' : 'mb-4 last:mb-0'}>
+            <div className={`flex justify-between items-center ${compact ? 'text-xs' : 'mb-2'}`}>
+                <span className={compact ? 'text-slate-500 font-medium' : 'text-[10px] font-black text-slate-500 uppercase tracking-widest'}>{label}</span>
+                <span className={compact ? 'font-bold text-slate-700' : 'text-sm font-bold text-slate-800'}>
+                    {unlimited ? 'Unlimited' : `${item.remaining} / ${item.limit}${compact ? ' left' : ''}`}
+                </span>
+            </div>
+            <div className={`w-full rounded-full ${compact ? 'bg-slate-100 h-1' : 'bg-slate-200 h-1.5'}`}>
+                <div className={`${barClass} rounded-full transition-all duration-500 ${compact ? 'h-1' : 'h-1.5'}`} style={{ width: `${pct}%` }} />
+            </div>
+        </div>
+    );
+}
+
+function QuotaBars({ profile, compact = false }: { profile: any; compact?: boolean }) {
+    const q = getQuota(profile);
+    if (!q) return null;
+    return (
+        <>
+            <QuotaRow label="Smart Searches" item={q.ai} barClass="bg-sky-500" compact={compact} />
+            <QuotaRow label="Profile Matches" item={q.standard} barClass="bg-violet-500" compact={compact} />
+            <QuotaRow label="Roulette Matches" item={q.roulette} barClass="bg-green-500" compact={compact} />
+        </>
+    );
+}
+
 export default function Dashboard() {
     const [isMatching, setIsMatching] = useState(false);
     const [intent, setIntent] = useState('');
@@ -44,6 +95,22 @@ export default function Dashboard() {
     const isInitialMountIntent = useRef(true);
     const matchLockRef = useRef(false);
     const lastClickTimeRef = useRef(0);
+
+    // Re-read the profile (incl. server-computed search quota). Called on load, after every
+    // search attempt and when the tab regains focus — before, the numbers were fetched once
+    // and never updated after a search.
+    const refreshProfile = () => {
+        fetchApi(`/users/profile/`)
+            .then(data => setProfile(data))
+            .catch(err => console.error("Profile fetch error:", err));
+    };
+
+    useEffect(() => {
+        const onFocus = () => { if (document.visibilityState === 'visible') refreshProfile(); };
+        document.addEventListener('visibilitychange', onFocus);
+        return () => document.removeEventListener('visibilitychange', onFocus);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     useEffect(() => {
         if (isInitialMountIntent.current) {
@@ -85,9 +152,7 @@ export default function Dashboard() {
             setUsername(userData.username);
             
             // NEW: Fetch full profile for subscription info
-            fetchApi(`/users/profile/`) 
-                .then(data => setProfile(data))
-                .catch(err => console.error("Profile fetch error:", err));
+            refreshProfile();
         } catch (e) {
             console.error("Failed to parse user data");
             window.location.href = '/login';
@@ -304,6 +369,7 @@ export default function Dashboard() {
                     is_polling: isRetry
                 })
             });
+            refreshProfile();
             if (response.status === 'no_online_users') {
                 setIsMatching(false);
                 setPendingIntent(intentText);
@@ -355,6 +421,7 @@ export default function Dashboard() {
                     distance_km: distanceKm
                 })
             });
+            refreshProfile();
             if (response.status === 'offline_activated') {
                 setIsMatching(false);
                 setIsOffline(false);
@@ -410,6 +477,7 @@ export default function Dashboard() {
                     is_polling: isRetry
                 })
             });
+            refreshProfile();
             if (response.status === 'no_online_users') {
                 setIsMatching(false);
                 matchLockRef.current = false;
@@ -788,7 +856,7 @@ export default function Dashboard() {
                         {/* Mobile Usage Stats (Visible only on small screens) */}
                         <div className="w-full max-w-xl mb-6 md:hidden">
                             <div className="bg-slate-50 p-5 rounded-2xl border border-slate-200 shadow-sm relative">
-                                {profile?.subscription_tier !== 'free' && profile?.subscription_expiry && (
+                                {getQuota(profile)?.is_premium && profile?.subscription_expiry && (
                                     <div className="absolute top-3 right-4 bg-gradient-to-r from-amber-500 to-orange-500 text-black text-[9px] font-black px-2 py-1 rounded-full uppercase tracking-widest shadow-sm">
                                         PRO • {(() => {
                                             const diff = new Date(profile.subscription_expiry).getTime() - Date.now();
@@ -800,20 +868,7 @@ export default function Dashboard() {
                                         })()}
                                     </div>
                                 )}
-                                <div className="flex justify-between items-center mb-2">
-                                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Smart Searches Left</span>
-                                    <span className="text-sm font-bold text-slate-800">{profile?.subscription_tier === 'free' ? Math.max(0, 4 - (profile?.daily_ai_llm_searches || 0)) + ' / 4' : Math.max(0, 40 - (profile?.daily_ai_llm_searches || 0)) + ' / 40'}</span>
-                                </div>
-                                <div className="w-full bg-slate-200 rounded-full h-1.5 mb-5">
-                                    <div className="bg-sky-500 h-1.5 rounded-full transition-all duration-500" style={{ width: `${Math.max(0, 100 - ((profile?.daily_ai_llm_searches || 0) / (profile?.subscription_tier === 'free' ? 4 : 40) * 100))}%` }}></div>
-                                </div>
-                                <div className="flex justify-between items-center mb-2">
-                                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Roulette Matches Left</span>
-                                    <span className="text-sm font-bold text-slate-800">{profile?.subscription_tier === 'free' ? Math.max(0, 20 - (profile?.daily_roulette_searches || 0)) + ' / 20' : 'Unlimited'}</span>
-                                </div>
-                                <div className="w-full bg-slate-200 rounded-full h-1.5">
-                                    <div className="bg-green-500 h-1.5 rounded-full transition-all duration-500" style={{ width: profile?.subscription_tier === 'free' ? `${Math.max(0, 100 - ((profile?.daily_roulette_searches || 0) / 20 * 100))}%` : '100%' }}></div>
-                                </div>
+                                <QuotaBars profile={profile} />
                             </div>
                         </div>
 
@@ -924,7 +979,7 @@ export default function Dashboard() {
                                     <span className="w-2.5 h-2.5 bg-green-500 rounded-full shadow-[0_0_10px_rgba(34,197,94,0.5)]" />
                                     <span className="font-semibold text-xs text-slate-600 uppercase tracking-widest">Active Status</span>
                                 </div>
-                                {profile?.subscription_tier !== 'free' && (
+                                {getQuota(profile)?.is_premium && (
                                     <div className="flex flex-col items-center gap-1">
                                         <motion.div 
                                             initial={{ scale: 0.8 }}
@@ -957,25 +1012,7 @@ export default function Dashboard() {
                                 <p className="text-[14px] text-slate-500 font-medium leading-relaxed">System synced. Ready for AI-powered networking.</p>
                                 
                                 <div className="mt-4 flex flex-col gap-3">
-                                    <div className="space-y-1">
-                                        <div className="flex items-center justify-between text-xs">
-                                            <span className="text-slate-500 font-medium">Smart Searches</span>
-                                            <span className="font-bold text-slate-700">{profile?.subscription_tier === 'free' ? Math.max(0, 4 - (profile?.daily_ai_llm_searches || 0)) + ' / 4 left' : Math.max(0, 40 - (profile?.daily_ai_llm_searches || 0)) + ' / 40 left'}</span>
-                                        </div>
-                                        <div className="w-full bg-slate-100 rounded-full h-1">
-                                            <div className="bg-sky-500 h-1 rounded-full transition-all duration-500" style={{ width: `${Math.max(0, 100 - ((profile?.daily_ai_llm_searches || 0) / (profile?.subscription_tier === 'free' ? 4 : 40) * 100))}%` }}></div>
-                                        </div>
-                                    </div>
-                                    
-                                    <div className="space-y-1">
-                                        <div className="flex items-center justify-between text-xs">
-                                            <span className="text-slate-500 font-medium">Roulette Matches</span>
-                                            <span className="font-bold text-slate-700">{profile?.subscription_tier === 'free' ? Math.max(0, 20 - (profile?.daily_roulette_searches || 0)) + ' / 20 left' : 'Unlimited'}</span>
-                                        </div>
-                                        <div className="w-full bg-slate-100 rounded-full h-1">
-                                            <div className="bg-green-500 h-1 rounded-full transition-all duration-500" style={{ width: profile?.subscription_tier === 'free' ? `${Math.max(0, 100 - ((profile?.daily_roulette_searches || 0) / 20 * 100))}%` : '100%' }}></div>
-                                        </div>
-                                    </div>
+                                    <QuotaBars profile={profile} compact />
                                 </div>
                             </div>
                             </motion.div>

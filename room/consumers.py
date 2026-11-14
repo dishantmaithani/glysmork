@@ -137,16 +137,9 @@ def _check_and_deduct_ai_quota(username):
     from django.contrib.auth.models import User
     try:
         user = User.objects.get(username=username)
-        profile = user.profile
-        
-        # Determine quota limit based on subscription (premium = 40, free = 4)
-        limit = 40 if profile.is_premium else 4
-            
-        if profile.daily_ai_llm_searches < limit:
-            profile.daily_ai_llm_searches += 1
-            profile.save(update_fields=['daily_ai_llm_searches'])
-            return True
-        return False
+        # Same limits, daily reset and atomic increment as Smart Search (users/quota.py)
+        from users import quota
+        return quota.consume(user.profile, 'ai')
     except Exception:
         return False
 

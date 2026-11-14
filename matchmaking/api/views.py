@@ -100,45 +100,32 @@ class JoinMatchmakingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # --- QUOTA & SUBSCRIPTION CHECK ---
-        today = timezone.localtime(timezone.now()).date()
+        # --- QUOTA & SUBSCRIPTION CHECK (users/quota.py is the single source of truth) ---
+        from users import quota
         profile = user.profile
-        if profile.last_quota_reset_date < today:
-            profile.daily_ai_llm_searches = 0
-            profile.daily_standard_searches = 0
-            profile.daily_roulette_searches = 0
-            profile.last_quota_reset_date = today
-            profile.save(update_fields=['daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches', 'last_quota_reset_date'])
-
-        # Check Subscription
+        quota.reset_if_new_day(profile)
         is_subbed = profile.is_premium
 
         mode_type = "ROULETTE" if intent.lower().startswith("random opposite gender") else "STANDARD"
-        
-        is_polling = request.data.get('is_polling', False)
-        
-        # Enforce limits
-        if not is_polling:
-            if mode_type == "ROULETTE":
-                if not is_subbed and profile.daily_roulette_searches >= 20:
-                    return Response({"status": "quota_exceeded", "message": "Free Roulette limit reached."})
-                profile.daily_roulette_searches += 1
-            else:
-                # For standard intents
-                if use_onboarding_data:
-                    # LLM heavy route
-                    limit = 40 if is_subbed else 4
-                    if profile.daily_ai_llm_searches >= limit:
-                        return Response({"status": "quota_exceeded", "message": "Daily AI limit reached."})
-                    profile.daily_ai_llm_searches += 1
-                else:
-                    # Basic vector/keyword match route
-                    limit = 100 if is_subbed else 4
-                    if profile.daily_standard_searches >= limit:
-                        return Response({"status": "quota_exceeded", "message": "Daily standard search limit reached."})
-                    profile.daily_standard_searches += 1
-                
-            profile.save(update_fields=['daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches'])
+        if mode_type == "ROULETTE":
+            kind = 'roulette'
+        elif use_onboarding_data:
+            kind = 'ai'          # Smart Search
+        else:
+            kind = 'standard'    # Persona / profile match
+
+        is_polling = str(request.data.get('is_polling', False)).lower() in ('true', '1')
+        # Connecting to someone you already found is not a new search.
+        is_direct_connect = intent.startswith('DIRECT_CONNECT:')
+
+        if not is_polling and not is_direct_connect:
+            if not quota.consume(profile, kind):
+                labels = {'ai': 'Smart Search', 'standard': 'Profile Match', 'roulette': 'Roulette'}
+                return Response({
+                    "status": "quota_exceeded",
+                    "message": f"Daily {labels[kind]} limit reached.",
+                    "quota": quota.summary(profile),
+                })
         # ----------------------------------
 
         # --- NEW: OFFLINE SEARCH REGISTRATION ---

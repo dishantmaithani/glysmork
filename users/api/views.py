@@ -80,6 +80,9 @@ class ProfileDetailView(generics.RetrieveUpdateAPIView):
         # We always return the profile of the requesting user for updates
         # Auto-create profile if it doesn't exist (e.g., for terminal-created superusers)
         profile, created = Profile.objects.get_or_create(user=self.request.user)
+        # New day? Zero yesterday's search counters before showing them.
+        from users import quota
+        quota.reset_if_new_day(profile)
         # SECURITY: removed the "auto-grant superuser by email/username" block.
         # Emails are not verified at signup, so anyone could register with that email and become admin.
         # Grant admin once on the server with:  python manage.py createsuperuser  (or the Django admin).
