@@ -1271,19 +1271,22 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if len(self.message_history) > 10:
                 self.message_history = self.message_history[-10:]
 
+            # Real ISO-8601 UTC time; the browser shows it in the viewer's own timezone
+            sent_at = datetime.now(dt_tz.utc).isoformat()
             await self.channel_layer.group_send(
                 self.room_group_name,
                 {
-                    'type': 'chat_message', 
-                    'message': message, 
+                    'type': 'chat_message',
+                    'message': message,
                     'username': username,
-                    'client_id': data.get('client_id')
+                    'client_id': data.get('client_id'),
+                    'date_iso': sent_at,
                 }
             )
 
             # Store in Redis if ephemeral session
             if self.room_name.startswith('session_'):
-                timestamp = datetime.now().strftime("%I:%M %p")
+                timestamp = sent_at  # was "04:52 PM" text -> "Invalid Date" in the UI
                 msg_data = {
                     "id": f"eph_{uuid.uuid4().hex[:8]}",
                     "sender": username,
@@ -1379,6 +1382,13 @@ class ChatConsumer(AsyncWebsocketConsumer):
             'username': event['username'],
             'client_id': event.get('client_id'),
             'id': event.get('id'),
+            'date_iso': event.get('date_iso'),
+            'timestamp': event.get('timestamp'),
+            # call-log entries pushed into the room
+            'is_call_log': event.get('is_call_log', False),
+            'call_mode': event.get('call_mode'),
+            'call_status': event.get('call_status'),
+            'call_duration': event.get('call_duration'),
         }))
 
     async def video_signal(self, event):

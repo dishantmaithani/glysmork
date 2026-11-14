@@ -24,6 +24,28 @@ genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
 from room.access import get_accessible_room, user_can_access_room
 
 
+def _iso_or_none(value):
+    """Return `value` if it's a parseable ISO-8601 datetime string, else None.
+    (Older session messages stored display text like "04:52 PM", which browsers can't
+    parse — the roulette chat showed "Invalid Date" for them.)"""
+    if not isinstance(value, str) or not value:
+        return None
+    from datetime import datetime as _dt
+    try:
+        _dt.fromisoformat(value.replace('Z', '+00:00'))
+        return value
+    except ValueError:
+        return None
+
+
+def _session_sort_key(msg):
+    """Sort session messages chronologically even when old ("04:52 PM") and new (ISO)
+    formats are mixed. Legacy-format messages were all written before ISO timestamps
+    existed, so they come first (in their original order); ISO messages follow by time."""
+    iso = _iso_or_none(msg.get('timestamp') or msg.get('ts'))
+    return (1, iso) if iso else (0, '')
+
+
 class RoomDetailView(APIView):
     """
     Returns the list of usernames in a room — only to members of that room.
@@ -277,14 +299,15 @@ class MessageListView(APIView):
             
             all_msgs = msg_list
             
-            # Sort by timestamp (ISO strings sort correctly)
-            all_msgs.sort(key=lambda x: x.get('timestamp', x.get('ts', '')))
-            
-            # Simple offset-based pagination for Redis list for now, 
+            # Chronological order (stable sort keeps legacy-format messages in insertion order)
+            all_msgs.sort(key=_session_sort_key)
+
+            # Simple offset-based pagination for Redis list for now,
             # as it's typically short-lived and doesn't have DB IDs
             # If cursor is provided, it's an ISO timestamp
             if cursor:
-                all_msgs = [m for m in all_msgs if m.get('timestamp', m.get('ts', '')) < cursor]
+                all_msgs = [m for m in all_msgs
+                            if (_iso_or_none(m.get('timestamp') or m.get('ts')) or '') < cursor]
             
             # Take last {limit}
             page_msgs = all_msgs[-limit:]
@@ -296,8 +319,10 @@ class MessageListView(APIView):
                     "id": msg.get('id', msg.get('ts')), # Use UUID or timestamp
                     "sender": msg.get('sender', msg.get('sender_id')),
                     "text": msg.get('text'),
-                    "status": msg.get('status', 'read'), 
+                    "status": msg.get('status', 'read'),
                     "timestamp": msg.get('timestamp', msg.get('ts')),
+                    # Real ISO time when we have one — the UI formats this in the viewer's timezone
+                    "date_iso": _iso_or_none(msg.get('timestamp') or msg.get('ts')),
                     "is_ephemeral": True,
                     "is_call_log": msg.get('is_call_log', False),
                     "call_mode": msg.get('call_mode'),
@@ -411,8 +436,9 @@ class MessageListView(APIView):
         if not text:
             return Response({"error": "Message text is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        import datetime
-        timestamp = datetime.datetime.now().strftime("%I:%M %p")
+        # Store a real ISO-8601 UTC timestamp. (Before: "04:52 PM" text in *server* time,
+        # which browsers can't parse -> "Invalid Date" in the roulette chat.)
+        timestamp = timezone.now().isoformat()
 
         if room_name.startswith('session_'):
             # EPHEMERAL: Save to Redis
@@ -425,6 +451,7 @@ class MessageListView(APIView):
                 "isRead": True,
                 "deletedForEveryone": False,
                 "timestamp": timestamp,
+                "date_iso": timestamp,
                 "is_ephemeral": True,
                 "client_id": request.data.get('client_id')
             }
@@ -444,6 +471,7 @@ class MessageListView(APIView):
                             'message': text,
                             'username': requesting_user.username,
                             'timestamp': timestamp,
+                            'date_iso': timestamp,
                             'isRead': True,
                             'deletedForEveryone': False,
                             'client_id': request.data.get('client_id')
@@ -476,6 +504,7 @@ class MessageListView(APIView):
                         'message': msg.value,
                         'username': msg.user.username,
                         'timestamp': msg.date.strftime("%I:%M %p"),
+                        'date_iso': msg.date.isoformat(),
                         'isRead': msg.is_read,
                         'deletedForEveryone': msg.deleted_for_everyone,
                         'client_id': request.data.get('client_id')
@@ -501,7 +530,8 @@ class MessageListView(APIView):
             "text": msg.value,
             "isRead": msg.is_read,
             "deletedForEveryone": msg.deleted_for_everyone,
-            "timestamp": msg.date.strftime("%I:%M %p")
+            "timestamp": msg.date.strftime("%I:%M %p"),
+            "date_iso": msg.date.isoformat(),
         }, status=status.HTTP_201_CREATED)
 
 

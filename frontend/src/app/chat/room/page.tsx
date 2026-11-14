@@ -22,6 +22,19 @@ interface ChatMessage {
     call_duration?: number;
 }
 
+/**
+ * Format a message time without ever showing "Invalid Date".
+ * New messages carry an ISO timestamp (shown in the viewer's timezone); older session
+ * messages were stored as display text like "04:52 PM", which is shown as-is.
+ */
+function formatMsgTime(ts?: string): string {
+    if (!ts) return 'Just now';
+    const d = new Date(ts);
+    if (!isNaN(d.getTime())) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (/^\d{1,2}:\d{2}(\s?[AP]M)?$/i.test(ts.trim())) return ts.trim();
+    return '';
+}
+
 interface AnalysisAlert {
     username: string;
     reason: string;
@@ -149,7 +162,8 @@ export default function ChatRoom() {
                 text: m.value || m.text || "",
                 isRead: m.is_read || m.isRead || false,
                 deletedForEveryone: m.deleted_for_everyone || m.deletedForEveryone || false,
-                timestamp: m.date || m.timestamp,
+                // Prefer the real ISO time; `timestamp` may be display text ("04:52 PM")
+                timestamp: m.date_iso || m.date || m.timestamp,
                 is_call_log: m.is_call_log,
                 call_mode: m.call_mode,
                 call_status: m.call_status,
@@ -587,7 +601,7 @@ export default function ChatRoom() {
                                     }`}>
                                         <p className="whitespace-pre-wrap">{msg.text}</p>
                                         <p className={`text-[11px] mt-1.5 font-medium ${isMe ? 'text-slate-300 text-right' : 'text-slate-400'}`}>
-                                            {msg.timestamp ? new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now'}
+                                            {formatMsgTime(msg.timestamp)}
                                         </p>
                                     </div>
                                 </div>
