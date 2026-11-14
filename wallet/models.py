@@ -20,7 +20,11 @@ class Payment(models.Model):
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     status = models.CharField(max_length=50)
     created_at = models.DateTimeField(auto_now_add=True)
-    
+    # SECURITY: what was bought is recorded server-side when the order is created,
+    # so the client can't change it at verify time.
+    razorpay_order_id = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+    plan = models.ForeignKey(SubscriptionPlan, on_delete=models.SET_NULL, null=True, blank=True)
+
     def __str__(self):
         return f"{self.user.username} - {self.product_type} - {self.status}"
 

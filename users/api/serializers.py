@@ -30,7 +30,23 @@ class ProfileSerializer(serializers.ModelSerializer):
             'daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches',
             'is_online',
         ]
-        read_only_fields = ['psychological_profile', 'last_quiz_taken', 'diamonds', 'is_verified', 'conversation_topics', 'trust_score', 'trust_tier']
+        # SECURITY: anything that is paid for, earned, or computed by the server must be read-only.
+        # Previously subscription_tier / subscription_expiry / quotas were writable via PATCH = free premium.
+        read_only_fields = [
+            'psychological_profile', 'last_quiz_taken', 'diamonds', 'is_verified',
+            'conversation_topics', 'trust_score', 'trust_tier',
+            'subscription_tier', 'is_premium', 'subscription_expiry',
+            'daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches',
+            'current_intent', 'persona_image_url',
+        ]
+
+    # Fields that must never be shown to anyone except the profile owner.
+    PRIVATE_FIELDS = (
+        'latitude', 'longitude', 'subscription_tier', 'is_premium', 'subscription_expiry',
+        'daily_ai_llm_searches', 'daily_standard_searches', 'daily_roulette_searches',
+        'diamonds', 'current_intent', 'hidden_data_fields', 'connection_preferences',
+        'self_reported_traits',
+    )
 
     def get_is_online(self, instance):
         return instance.is_online()
@@ -43,6 +59,16 @@ class ProfileSerializer(serializers.ModelSerializer):
         except Exception:
             pass
         return f'https://api.dicebear.com/7.x/adventurer/png?seed={instance.user.username}&size=200'
+
+    def validate_image(self, value):
+        # SECURITY: same validation/re-encoding as the dedicated upload endpoint.
+        if not value:
+            return value
+        from users.api.views import sanitize_uploaded_image
+        try:
+            return sanitize_uploaded_image(value)
+        except ValueError as e:
+            raise serializers.ValidationError(str(e))
 
     def update(self, instance, validated_data):
         user_data = self.context['request'].data.get('user')
@@ -60,11 +86,18 @@ class ProfileSerializer(serializers.ModelSerializer):
         data = super().to_representation(instance)
         
         request = self.context.get('request')
-        if request and request.user != instance.user:
+        is_owner = bool(request and request.user.is_authenticated and request.user == instance.user)
+        if not is_owner:
+            # SECURITY: never expose another user's email or exact location.
+            public_user = {'id': instance.user.id, 'username': instance.user.username}
             if not instance.is_profile_public:
-                return {'user': data['user'], 'message': 'This profile is private.'}
-                
-            for field in instance.hidden_data_fields:
+                return {'user': public_user, 'message': 'This profile is private.'}
+
+            data['user'] = public_user
+            for field in self.PRIVATE_FIELDS:
+                data.pop(field, None)
+
+            for field in (instance.hidden_data_fields or []):
                 if field in data:
                     data.pop(field)
                     

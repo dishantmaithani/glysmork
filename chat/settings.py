@@ -23,12 +23,18 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-(@x7v=^ivf7(#z^)kf2quks!4=lt@#$x=3#p6#t-%cg+c=c-+_')
+# SECURITY: DEBUG is OFF unless explicitly enabled (set DEBUG=True in your local .env for development).
+DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DEBUG', 'True') == 'True'
+# SECURITY: SECRET_KEY must come from the environment in production.
+# (The old hardcoded fallback was public on GitHub, so anyone could forge JWTs with it.)
+SECRET_KEY = os.environ.get('SECRET_KEY')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'dev-only-insecure-key-do-not-use-in-production'
+    else:
+        from django.core.exceptions import ImproperlyConfigured
+        raise ImproperlyConfigured('SECRET_KEY environment variable is required when DEBUG is False.')
 
 # Trust X-Forwarded-Proto for HTTPS on Railway/Heroku
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
@@ -44,7 +50,9 @@ if not DEBUG:
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
 
-ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',')
+ALLOWED_HOSTS = [h.strip() for h in os.environ.get(
+    'ALLOWED_HOSTS', 'api.glysmork.com,localhost,127.0.0.1'
+).split(',') if h.strip()]
 
 CSRF_TRUSTED_ORIGINS = [
     'https://*.ngrok-free.app',
@@ -133,6 +141,11 @@ CSRF_TRUSTED_ORIGINS = [
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ],
+    # SECURITY: every API view requires a logged-in user unless it explicitly opts out
+    # with permission_classes = [AllowAny] (login, register, social login, plans, ...).
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
     ],
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
@@ -285,8 +298,9 @@ EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST = 'smtp.gmail.com'
 EMAIL_PORT = 587
 EMAIL_USE_TLS = True
-EMAIL_HOST_USER = 'glysmork@gmail.com'
-EMAIL_HOST_PASSWORD = 'rxhp pgls pogm ykay'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', 'glysmork@gmail.com')
+# SECURITY: never hardcode this. The previous app password was public on GitHub — revoke it in Google.
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
 
 # Razorpay Configuration
 RAZORPAY_KEY_ID = os.environ.get('RAZORPAY_KEY_ID', '')

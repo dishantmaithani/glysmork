@@ -65,22 +65,11 @@ class JoinMatchmakingView(APIView):
     The AI analyzes all available profiles to find the perfect match.
     This is NOT dating — it's connecting minds based on intent, expertise, interest, and personality.
     """
-    # permission_classes = [IsAuthenticated] # Temporarily disabled for Next.js testing
+    # SECURITY: must be logged in; always acts as the logged-in user (body `username` ignored).
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        if request.user.is_authenticated:
-            user = request.user
-        else:
-            # Try username from request body (cross-origin Next.js frontend)
-            username_from_body = request.data.get('username')
-            from django.contrib.auth.models import User as AuthUser
-            if username_from_body:
-                try:
-                    user = AuthUser.objects.get(username=username_from_body)
-                except AuthUser.DoesNotExist:
-                    return Response({"error": f"User '{username_from_body}' not found."}, status=status.HTTP_404_NOT_FOUND)
-            else:
-                return Response({"error": "Authentication required. Please provide a username or log in."}, status=status.HTTP_401_UNAUTHORIZED)
+        user = request.user
         intent = request.data.get('intent', '').strip()
         is_offline = request.data.get('is_offline', False)
         mode_pref = request.data.get('mode', 'chat') # chat or video
@@ -99,7 +88,10 @@ class JoinMatchmakingView(APIView):
         if not isinstance(country_filter, list): country_filter = []
         if not isinstance(language_filter, list): language_filter = []
         
-        distance_km = int(request.data.get('distance_km', 0) or 0)               # 0 = disabled
+        try:
+            distance_km = max(0, int(request.data.get('distance_km', 0) or 0))  # 0 = disabled
+        except (TypeError, ValueError):
+            distance_km = 0
         use_onboarding_data = str(request.data.get('use_onboarding_data', 'false')).lower() in ['true', '1']
         
         if not intent and not is_offline:
@@ -614,27 +606,12 @@ class JoinMatchmakingView(APIView):
 class FriendshipActionView(APIView):
     """
     Handles social actions: request, accept, decline, remove.
+    SECURITY: always acts as the logged-in user (the `username` param is ignored).
     """
+    permission_classes = [IsAuthenticated]
+
     def _resolve_user(self, request):
-        if hasattr(request, 'user') and request.user and getattr(request.user, 'is_authenticated', False):
-            return request.user
-        
-        # Check body (POST) or query params (GET)
-        username = None
-        if hasattr(request, 'data') and isinstance(request.data, dict):
-            username = request.data.get('username')
-        if not username and hasattr(request, 'query_params'):
-            username = request.query_params.get('username')
-        if not username and hasattr(request, 'GET'):
-            username = request.GET.get('username')
-        
-        if username:
-            from django.contrib.auth.models import User as AuthUser
-            try:
-                return AuthUser.objects.get(username=username)
-            except AuthUser.DoesNotExist:
-                return None
-        return None
+        return request.user
 
     def post(self, request):
         user = self._resolve_user(request)
@@ -646,12 +623,14 @@ class FriendshipActionView(APIView):
         
         if not target_username or not action:
             return Response({"error": "Action and target_username required"}, status=status.HTTP_400_BAD_REQUEST)
-        
+
         from django.contrib.auth.models import User as AuthUser
         try:
             target_user = AuthUser.objects.get(username=target_username)
         except AuthUser.DoesNotExist:
             return Response({"error": "Target user not found"}, status=status.HTTP_404_NOT_FOUND)
+        if target_user == user:
+            return Response({"error": "You can't do that to yourself"}, status=status.HTTP_400_BAD_REQUEST)
 
         if action == 'request':
             try:
@@ -701,9 +680,17 @@ class FriendshipActionView(APIView):
         
         elif action == 'accept':
             try:
+                # SECURITY: you can only accept a request the other person actually sent you.
+                incoming = Friendship.objects.filter(from_user=target_user, to_user=user).first()
+                if incoming is None:
+                    return Response({"error": "No friend request from this user"}, status=status.HTTP_400_BAD_REQUEST)
+                if incoming.status == 'accepted':
+                    return Response({"status": "accepted"})  # idempotent; don't re-award trust points
+
                 # Update the incoming request
-                Friendship.objects.filter(from_user=target_user, to_user=user).update(status='accepted')
-                
+                incoming.status = 'accepted'
+                incoming.save(update_fields=['status'])
+
                 # Create or update reciprocal friendship
                 Friendship.objects.update_or_create(
                     from_user=user, to_user=target_user,
@@ -786,25 +773,26 @@ class FriendshipActionView(APIView):
 
 
 class SendChatNotificationView(APIView):
-    """Send a notification to a user that someone wants to chat or sent a message."""
-    permission_classes = []
+    """Send a notification to a user that someone wants to chat or sent a message.
+    SECURITY: the sender is always the logged-in user (the `sender` field is ignored),
+    and the notification text is limited in length."""
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
         from django.contrib.auth.models import User
         from django.utils import timezone
 
-        sender_username = request.data.get('sender')
+        sender = request.user
         receiver_username = request.data.get('receiver')
-        room_name = request.data.get('room_name', '')
-        message_text = request.data.get('message', f'{sender_username} sent you a message!')
+        room_name = str(request.data.get('room_name', '') or '')[:200]
+        message_text = str(request.data.get('message') or f'{sender.username} sent you a message!')[:300]
 
-        if not sender_username or not receiver_username:
-            return Response({'error': 'sender and receiver required'}, status=status.HTTP_400_BAD_REQUEST)
-        if sender_username == receiver_username:
+        if not receiver_username:
+            return Response({'error': 'receiver required'}, status=status.HTTP_400_BAD_REQUEST)
+        if sender.username == receiver_username:
             return Response({'error': 'cannot notify yourself'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            sender = User.objects.get(username=sender_username)
             receiver = User.objects.get(username=receiver_username)
         except User.DoesNotExist:
             return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
@@ -841,15 +829,14 @@ class SendChatNotificationView(APIView):
         return Response({'status': 'sent', 'created': created}, status=status.HTTP_200_OK)
 
 class GetNotificationsView(APIView):
-    """View to fetch unread chat notifications."""
+    """View to fetch unread chat notifications.
+    SECURITY: only the logged-in user's own notifications (the `username` param is ignored)."""
+    permission_classes = [IsAuthenticated]
+
     def get(self, request):
-        username = request.query_params.get('username')
-        if not username:
-            return Response({"error": "Username required"}, status=status.HTTP_400_BAD_REQUEST)
-        
         since = timezone.now() - timedelta(hours=24)
         notifs = ChatNotification.objects.filter(
-            receiver__username=username,
+            receiver=request.user,
             is_read=False,
             created_at__gte=since,
         ).order_by('-created_at')[:10]
@@ -861,23 +848,19 @@ class GetNotificationsView(APIView):
     def post(self, request):
         """Mark notifications as read."""
         notif_ids = request.data.get('ids', [])
-        if notif_ids:
-            ChatNotification.objects.filter(id__in=notif_ids).update(is_read=True)
+        if notif_ids and isinstance(notif_ids, list):
+            ChatNotification.objects.filter(id__in=notif_ids, receiver=request.user).update(is_read=True)
         return Response({"status": "success"}, status=status.HTTP_200_OK)
 
 class TestNotificationView(APIView):
 
-    """Diagnostic view to test real-time WebSocket signals."""
+    """Diagnostic view to test real-time WebSocket signals.
+    SECURITY: admin-only and only to the caller's own socket (was an anonymous spam endpoint)."""
+    from rest_framework.permissions import IsAdminUser
+    permission_classes = [IsAdminUser]
+
     def post(self, request):
-        username = request.data.get('username')
-        if not username:
-            return Response({"error": "Username required"}, status=status.HTTP_400_BAD_REQUEST)
-        
-        try:
-            from django.contrib.auth.models import User
-            user = User.objects.get(username=username)
-        except User.DoesNotExist:
-            return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
+        user = request.user
 
         from channels.layers import get_channel_layer
         from asgiref.sync import async_to_sync
@@ -896,21 +879,26 @@ class TestNotificationView(APIView):
         return Response({"error": "No channel layer"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class UpdateLocationView(APIView):
-    """Update user's latitude and longitude."""
+    """Update the logged-in user's latitude and longitude.
+    SECURITY: the `username` field is ignored — you can only set your own location."""
+    permission_classes = [IsAuthenticated]
+
     def post(self, request):
-        username = request.data.get('username')
+        username = request.user.username
         lat = request.data.get('latitude')
         lng = request.data.get('longitude')
-        
-        if not username or lat is None or lng is None:
-            return Response({"error": "Username, latitude, and longitude required"}, status=status.HTTP_400_BAD_REQUEST)
-            
+
+        if lat is None or lng is None:
+            return Response({"error": "latitude and longitude required"}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             from django.contrib.auth.models import User
-            user = User.objects.get(username=username)
-            profile = user.profile
-            profile.latitude = float(lat)
-            profile.longitude = float(lng)
+            lat_f, lng_f = float(lat), float(lng)
+            if not (-90 <= lat_f <= 90 and -180 <= lng_f <= 180):
+                return Response({"error": "Invalid coordinates"}, status=status.HTTP_400_BAD_REQUEST)
+            profile = request.user.profile
+            profile.latitude = lat_f
+            profile.longitude = lng_f
             
             # Generate Geohash for high-performance indexing
             from matchmaking.utils import geohash_encode

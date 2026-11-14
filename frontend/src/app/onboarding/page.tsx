@@ -29,6 +29,14 @@ const getApiBaseUrl = () => {
 };
 
 const ONBOARDING_URL = getOnboardingUrl();
+
+// The onboarding service now requires the same JWT as the Django API (it no longer trusts user_id).
+const onboardingHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    return headers;
+};
 const API_BASE = getApiBaseUrl();
 
 export default function OnboardingChat() {
@@ -102,9 +110,8 @@ export default function OnboardingChat() {
             if (step === 1 && userMsg) {
                 const res = await fetch(`${ONBOARDING_URL}/onboarding/identify-buckets`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: onboardingHeaders(),
                     body: JSON.stringify({
-                        user_id: 1, // Fallback ID for testing until auth passes real IDs
                         opening_answer: userMsg
                     })
                 });
@@ -116,9 +123,8 @@ export default function OnboardingChat() {
             // STEP 2: The Chat Conversation
             const res = await fetch(`${ONBOARDING_URL}/onboarding/chat`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: onboardingHeaders(),
                 body: JSON.stringify({
-                    user_id: 1, // Fallback ID
                     message: userMsg,
                     conversation_history: currentMsgs.map(m => ({ role: m.role, content: m.text })),
                 })
@@ -163,9 +169,8 @@ export default function OnboardingChat() {
             try {
                 await fetch(`${ONBOARDING_URL}/onboarding/extract`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: onboardingHeaders(),
                     body: JSON.stringify({
-                        user_id: 1, // Fallback user_id for test
                         full_conversation_history: msgs.map(m => ({ role: m.role, content: m.text }))
                     })
                 });

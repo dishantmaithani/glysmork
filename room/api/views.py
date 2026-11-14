@@ -26,37 +26,25 @@ import os
 import google.generativeai as genai
 import json
 
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", "AIzaSyDLmm8qKlIUV1wTqRkh1hW3Pgu_Awf8JfU"))
+# SECURITY: no hardcoded fallback key (the old one was public on GitHub — revoke it).
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+
+from room.access import get_accessible_room, user_can_access_room
 
 
 class RoomDetailView(APIView):
     """
-    Returns the list of usernames in a room. Open to all so the chat
-    frontend can display who you are connected to without session auth.
+    Returns the list of usernames in a room — only to members of that room.
     """
-    permission_classes = []  # AllowAny
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, room_name):
-        try:
-            room = Room.objects.get(name=room_name)
-        except Room.DoesNotExist:
-            if room_name.startswith('direct_'):
-                room = Room.objects.create(name=room_name)
-                parts = room_name.split('_')
-                if len(parts) == 3:
-                    from django.contrib.auth.models import User
-                    try:
-                        u1 = User.objects.get(username=parts[1])
-                        u2 = User.objects.get(username=parts[2])
-                        room.users.add(u1, u2)
-                        from matchmaking.api.views import get_commonality_reason
-                        room.match_reason = get_commonality_reason(u1.profile, u2.profile)
-                        room.save()
-                    except User.DoesNotExist:
-                        pass
-            else:
-                return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
-        
+        allowed, room = get_accessible_room(request.user, room_name, create_direct=True)
+        if not allowed:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+        if room is None:
+            return Response({"room": room_name, "users": [], "is_active": True, "match_reason": None})
+
         usernames = list(room.users.values_list('username', flat=True))
         return Response({
             "room": room_name, 
@@ -70,56 +58,43 @@ class RoomStatusView(APIView):
     Lightweight check to see if a room is still active.
     Used by frontend polling fallback for synchronized exit.
     """
-    permission_classes = [] 
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, room_name):
-        print("hi")
-        try:
-            room = Room.objects.get(name=room_name)
-            return Response({"is_active": room.is_active})
-        except Room.DoesNotExist:
-            if room_name.startswith('direct_'):
-                return Response({"is_active": True}) # It will be created on detail
+        allowed, room = get_accessible_room(request.user, room_name)
+        if not allowed:
             return Response({"is_active": False})
+        if room is None:
+            # direct room not created yet / ephemeral session with no DB row
+            return Response({"is_active": True})
+        return Response({"is_active": room.is_active})
 
 class RoomCloseView(APIView):
     """
     Sets a room's is_active status to False.
     Called when a user confirms severance of the connection.
     """
-    permission_classes = [] # AllowAny for now
-    
+    permission_classes = [IsAuthenticated]
+
     def post(self, request, room_name):
-        try:
-            room = Room.objects.get(name=room_name)
-            room.is_active = False
-            room.save()
-            return Response({"status": "closed"})
-        except Room.DoesNotExist:
+        allowed, room = get_accessible_room(request.user, room_name)
+        if not allowed or room is None:
             return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+        room.is_active = False
+        room.save(update_fields=['is_active'])
+        return Response({"status": "closed"})
 
 class ConversationListView(APIView):
     """
     Returns all rooms the user has participated in, 
     formatted as an Inbox/Conversation list.
+    SECURITY: always the logged-in user's own inbox (the `username` query param is ignored).
     """
-    def _resolve_user(self, request):
-        if request.user.is_authenticated:
-            return request.user
-        username = request.query_params.get('username') or request.data.get('username')
-        if username:
-            from django.contrib.auth.models import User as AuthUser
-            try:
-                return AuthUser.objects.get(username=username)
-            except AuthUser.DoesNotExist:
-                return None
-        return None
+    permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        user = self._resolve_user(request)
-        if not user:
-            return Response({"error": "No user context"}, status=status.HTTP_401_UNAUTHORIZED)
-        
+        user = request.user
+
         rooms = user.rooms.all().order_by('-created_at')
         data = []
         for room in rooms:
@@ -272,34 +247,17 @@ class MessageListView(APIView):
     """
     GET: Retrieve recent messages for a room.
     POST: Send a new message to the room.
-    Accepts `username` as query param (GET) or body field (POST) when session auth is unavailable.
+    SECURITY: requires login; only members of the room can read or post, and the sender
+    is always the logged-in user (any `username` sent by the client is ignored).
     """
-    permission_classes = []  # AllowAny — user resolved via username param
-
-    def _resolve_user(self, request):
-        """Return authenticated user or look up by username from request data."""
-        if request.user.is_authenticated:
-            return request.user
-        from django.contrib.auth.models import User as AuthUser
-        username = request.query_params.get('username') or request.data.get('username')
-        if username:
-            try:
-                return AuthUser.objects.get(username=username)
-            except AuthUser.DoesNotExist:
-                return None
-        return None
+    permission_classes = [IsAuthenticated]
 
     def get(self, request, room_name):
-        try:
-            room = Room.objects.get(name=room_name)
-        except Room.DoesNotExist:
-            if room_name.startswith('session_') or room_name.startswith('direct_'):
-                # We'll assume it exists or will be created on POST
-                room = None
-            else:
-                return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+        allowed, room = get_accessible_room(request.user, room_name)
+        if not allowed:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        requesting_user = self._resolve_user(request)
+        requesting_user = request.user
         
         # Pagination params
         cursor = request.query_params.get('cursor') # timestamp or ID
@@ -463,9 +421,10 @@ class MessageListView(APIView):
         }, status=status.HTTP_200_OK)
 
     def post(self, request, room_name):
-        requesting_user = self._resolve_user(request)
-        if not requesting_user:
-            return Response({"error": "Provide a valid username."}, status=status.HTTP_400_BAD_REQUEST)
+        allowed, room = get_accessible_room(request.user, room_name, create_direct=True)
+        if not allowed:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
+        requesting_user = request.user
 
         text = request.data.get('text')
         if not text:
@@ -513,33 +472,8 @@ class MessageListView(APIView):
 
             return Response(msg_data, status=status.HTTP_201_CREATED)
 
-        try:
-            room = Room.objects.get(name=room_name)
-        except Room.DoesNotExist:
-            if room_name.startswith('direct_'):
-                room = Room.objects.create(name=room_name)
-                parts = room_name.split('_')
-                if len(parts) == 3:
-                    from django.contrib.auth.models import User
-                    try:
-                        u1 = User.objects.get(username=parts[1])
-                        u2 = User.objects.get(username=parts[2])
-                        room.users.add(u1, u2)
-                        from matchmaking.api.views import get_commonality_reason
-                        room.match_reason = get_commonality_reason(u1.profile, u2.profile)
-                        room.save()
-                    except User.DoesNotExist:
-                        pass
-            else:
-                return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        requesting_user = self._resolve_user(request)
-        if not requesting_user:
-            return Response({"error": "Provide a valid username."}, status=status.HTTP_400_BAD_REQUEST)
-
-        text = request.data.get('text')
-        if not text:
-            return Response({"error": "Message text is required"}, status=status.HTTP_400_BAD_REQUEST)
+        if room is None:
+            return Response({"error": "Room not found"}, status=status.HTTP_404_NOT_FOUND)
 
         msg = Message.objects.create(
             user=requesting_user,

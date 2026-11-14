@@ -1,5 +1,5 @@
 from django.urls import path
-from .views import ProfileDetailView, PublicProfileView, AIOnboardingQuizView, ImprovementBotView, LoginView, RegisterView, GoogleLoginView, FacebookLoginView, OnlineCountView, HeartbeatView, AnalyticsView, AdminAnalyticsView, TrustScoreView, ReportUserView, BlockUserView, ImageUploadView, debug_cache, AdminReportListView, AdminReportContextView, AdminBanUserView
+from .views import ProfileDetailView, PublicProfileView, AIOnboardingQuizView, ImprovementBotView, LoginView, RegisterView, GoogleLoginView, FacebookLoginView, OnlineCountView, HeartbeatView, AnalyticsView, AdminAnalyticsView, TrustScoreView, ReportUserView, BlockUserView, ImageUploadView, AdminReportListView, AdminReportContextView, AdminBanUserView
 from .subscriptions import StripeCheckoutView, StripeWebhookView
 
 urlpatterns = [
@@ -19,7 +19,6 @@ urlpatterns = [
     path('heartbeat/', HeartbeatView.as_view(), name='api-heartbeat'),
     path('admin/analytics/', AdminAnalyticsView.as_view(), name='api-admin-analytics'),
     path('analytics/', AnalyticsView.as_view(), name='api-analytics'),
-    path('debug-cache/', debug_cache, name='api-debug-cache'),
     
     # Subscriptions
     path('subscription/checkout/', StripeCheckoutView.as_view(), name='api-subscription-checkout'),

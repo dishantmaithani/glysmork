@@ -23,16 +23,50 @@ import uuid
 
 load_dotenv()
 
-@api_view(['GET'])
-@permission_classes([AllowAny])
-def debug_cache(request):
-    from django.core.cache import cache
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def sanitize_uploaded_image(uploaded_file):
+    """
+    SECURITY: accept only real JPEG/PNG/WEBP/GIF images and re-encode them.
+    Re-encoding strips any embedded script/HTML (e.g. a renamed .html or .svg file),
+    and the random .jpg/.png name means the server never serves it as HTML.
+    Raises ValueError with a user-friendly message on bad input.
+    """
+    from io import BytesIO
+    from PIL import Image
+    from django.core.files.base import ContentFile
+
+    if uploaded_file.size > MAX_IMAGE_BYTES:
+        raise ValueError("Image is too large (max 5 MB).")
     try:
-        keys = list(cache._cache.keys())
-        data = {str(k): str(cache._cache.get(k)) for k in keys}
-        return Response({"cache": data})
-    except Exception as e:
-        return Response({"error": str(e)})
+        probe = Image.open(uploaded_file)
+        probe.verify()  # detects non-images / corrupted files
+        uploaded_file.seek(0)
+        img = Image.open(uploaded_file)
+        if img.format not in ('JPEG', 'PNG', 'WEBP', 'GIF'):
+            raise ValueError("Only JPEG, PNG, WEBP or GIF images are allowed.")
+        if img.width * img.height > 40_000_000:
+            raise ValueError("Image dimensions are too large.")
+        img.load()
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("The uploaded file is not a valid image.")
+
+    has_alpha = img.mode in ('RGBA', 'LA', 'P')
+    out = BytesIO()
+    if has_alpha:
+        img.convert('RGBA').save(out, format='PNG', optimize=True)
+        ext = 'png'
+    else:
+        img.convert('RGB').save(out, format='JPEG', quality=88)
+        ext = 'jpg'
+    return ContentFile(out.getvalue(), name=f"{uuid.uuid4().hex}.{ext}")
+
+
+# SECURITY: the anonymous `debug_cache` endpoint (dumped every cache key/value,
+# including private session chat messages) has been removed.
 
 class ProfileDetailView(generics.RetrieveUpdateAPIView):
     """
@@ -46,13 +80,9 @@ class ProfileDetailView(generics.RetrieveUpdateAPIView):
         # We always return the profile of the requesting user for updates
         # Auto-create profile if it doesn't exist (e.g., for terminal-created superusers)
         profile, created = Profile.objects.get_or_create(user=self.request.user)
-        
-        # Auto-grant admin on the live server for the founder
-        if (self.request.user.email in ('ganeshmaharaj444@gmail.com', 'ganeshmaharaj484@gmail.com') or self.request.user.username == 'ganeshmaharaj484') and not self.request.user.is_staff:
-            self.request.user.is_staff = True
-            self.request.user.is_superuser = True
-            self.request.user.save()
-
+        # SECURITY: removed the "auto-grant superuser by email/username" block.
+        # Emails are not verified at signup, so anyone could register with that email and become admin.
+        # Grant admin once on the server with:  python manage.py createsuperuser  (or the Django admin).
         return profile
 
 class PublicProfileView(generics.RetrieveUpdateAPIView):
@@ -80,26 +110,12 @@ class AIOnboardingQuizView(APIView):
     Uses AI to analyze for "cap" (lies) and generates the psychological profile.
     Enforces a strict 1-week cooldown.
     """
-    # permission_classes = [IsAuthenticated] # Temporarily disabled for Next.js testing
+    # SECURITY: must be logged in; the profile is always the caller's own (never a `username` from the body).
+    permission_classes = [IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        # Priority 1: Session-authenticated user
-        if request.user.is_authenticated:
-            profile = request.user.profile
-        else:
-            # Priority 2: username passed in request body (for cross-origin Next.js frontend)
-            username_from_body = request.data.get('username')
-            if username_from_body:
-                from django.contrib.auth.models import User
-                try:
-                    user = User.objects.get(username=username_from_body)
-                    profile = user.profile
-                except User.DoesNotExist:
-                    return Response({"error": f"User '{username_from_body}' not found."}, status=status.HTTP_404_NOT_FOUND)
-            else:
-                return Response({"error": "Authentication required. Please provide a username or log in."}, status=status.HTTP_401_UNAUTHORIZED)
+        profile, _ = Profile.objects.get_or_create(user=request.user)
 
-        
         # Check Cooldown Limit (2 times per week)
         today = timezone.localtime(timezone.now()).date()
         if not profile.weekly_quiz_reset_date or (today - profile.weekly_quiz_reset_date).days >= 7:
@@ -314,12 +330,19 @@ class GoogleLoginView(APIView):
 
         client_id = os.environ.get('GOOGLE_CLIENT_ID')
         if not client_id:
-             # Fallback for development if not set, but warn
-             print("WARNING: GOOGLE_CLIENT_ID not set in environment.")
+            # SECURITY: without a client id Google's library skips the audience check,
+            # meaning a token issued to ANY app would be accepted. Fail closed.
+            return Response({"error": "Google login is not configured on the server."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
 
         try:
-            # Verify the ID token
+            # Verify the ID token (signature, expiry and audience == our client id)
             idinfo = id_token.verify_oauth2_token(token, google_requests.Request(), client_id)
+
+            # SECURITY: only trust emails Google has verified, since we link accounts by email.
+            if not idinfo.get('email') or not idinfo.get('email_verified'):
+                return Response({"error": "Your Google email address is not verified."},
+                                status=status.HTTP_401_UNAUTHORIZED)
 
             # ID token is valid. Get user details.
             email = idinfo['email']
@@ -373,10 +396,30 @@ class FacebookLoginView(APIView):
         if not access_token:
             return Response({"error": "Facebook access token required"}, status=status.HTTP_400_BAD_REQUEST)
 
+        # SECURITY: confirm the token was issued to OUR Facebook app. Without this check,
+        # a token from any other Facebook app (e.g. a malicious quiz app) could log into
+        # the Glysmork account that has the same email.
+        fb_app_id = os.environ.get('FACEBOOK_APP_ID')
+        fb_app_secret = os.environ.get('FACEBOOK_APP_SECRET')
+        if not fb_app_id or not fb_app_secret:
+            return Response({"error": "Facebook login is not configured on the server."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
         try:
-            # Verify the token with Facebook Graph API
-            fb_url = f"https://graph.facebook.com/me?fields=id,name,email,first_name,last_name&access_token={access_token}"
-            fb_response = requests.get(fb_url)
+            debug = requests.get(
+                "https://graph.facebook.com/debug_token",
+                params={"input_token": access_token, "access_token": f"{fb_app_id}|{fb_app_secret}"},
+                timeout=10,
+            ).json().get('data', {})
+            if not debug.get('is_valid') or str(debug.get('app_id')) != str(fb_app_id):
+                return Response({"error": "Invalid Facebook token."}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # Token is ours — fetch the profile
+            fb_response = requests.get(
+                "https://graph.facebook.com/me",
+                params={"fields": "id,name,email,first_name,last_name", "access_token": access_token},
+                timeout=10,
+            )
             fb_data = fb_response.json()
 
             if 'error' in fb_data:
@@ -532,19 +575,12 @@ class OnlineCountView(APIView):
 
 class HeartbeatView(APIView):
     """Frontend pings this every 30s to keep last_seen fresh."""
-    permission_classes = [AllowAny]
+    # SECURITY: only the logged-in user can mark *themselves* online (the `username` field is ignored).
+    permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        username = request.data.get('username')
-        if not username:
-            return Response({'error': 'username required'}, status=status.HTTP_400_BAD_REQUEST)
-        try:
-            profile = Profile.objects.get(user__username=username)
-            profile.last_seen = timezone.now()
-            profile.save(update_fields=['last_seen'])
-            return Response({'status': 'ok'})
-        except Profile.DoesNotExist:
-            return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
+        Profile.objects.filter(user=request.user).update(last_seen=timezone.now())
+        return Response({'status': 'ok'})
 
 
 
@@ -743,7 +779,11 @@ class ImageUploadView(APIView):
             return Response({"error": "No image provided."}, status=status.HTTP_400_BAD_REQUEST)
         
         image_file = request.FILES['image']
-        profile.image = image_file
+        try:
+            safe_file = sanitize_uploaded_image(image_file)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        profile.image = safe_file
         profile.save()
         
         return Response({

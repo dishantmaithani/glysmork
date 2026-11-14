@@ -141,33 +141,21 @@ def _check_and_deduct_ai_quota(username):
 
 @sync_to_async
 def _save_friend_message(sender, room_name, text):
-    """Persist a friend (direct) message to PostgreSQL."""
-    from room.models import Room, Message, CHAT_TYPE_FRIEND
-    room, created = Room.objects.get_or_create(
-        name=room_name,
-        defaults={'chat_type': CHAT_TYPE_FRIEND}
-    )
-    
-    # Ensure users are associated with the room if new or missing
-    if created or room.users.count() < 2:
-        parts = room_name.replace('direct_', '').split('_')
-        if len(parts) == 2:
-            from django.contrib.auth.models import User
-            users = User.objects.filter(username__in=parts)
-            room.users.set(users)
+    """Persist a friend (direct) message to PostgreSQL.
+    SECURITY: returns None (and saves nothing) unless `sender` is a member of the room."""
+    from room.models import Message
+    from room.access import get_accessible_room
+
+    if not room_name.startswith('direct_'):
+        return None
+    allowed, room = get_accessible_room(sender, room_name, create_direct=True)
+    if not allowed or room is None:
+        return None
 
     msg = Message.objects.create(user=sender, room=room, value=text)
-    
+
     # 3. Handle notifications for the recipient (partner)
-    # We re-query the room's users to ensure we have the latest association
     partner = room.users.exclude(id=sender.id).only('id', 'username').first()
-    
-    # Fallback: if M2M relationship is still being populated in this thread, 
-    # parse from room_name directly as a safety measure
-    if not partner:
-        parts = room_name.replace('direct_', '').split('_')
-        from django.contrib.auth.models import User
-        partner = User.objects.filter(username__in=parts).exclude(id=sender.id).first()
 
     if partner:
         from matchmaking.models import ChatNotification
@@ -568,6 +556,10 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                     return
             session = json.loads(raw)
 
+            # SECURITY: only the two participants of this session may post into it.
+            if str(self.user.id) not in (str(session.get('from_user_id')), str(session.get('to_user_id'))):
+                return
+
             msg_obj = {
                 'id': str(uuid.uuid4()),
                 'client_id': data.get('client_id'),
@@ -584,7 +576,7 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             # Forward to the other participant
             peer_id = (
                 session['to_user_id']
-                if self.user.id == session['from_user_id']
+                if str(self.user.id) == str(session['from_user_id'])
                 else session['from_user_id']
             )
             await self.channel_layer.group_send(
@@ -601,18 +593,20 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         # ── friend messaging (permanent, stored in PostgreSQL) ─────────────
 
         elif msg_type == 'friend_message':
-            print("hi i am a friend")
             conversation_id = data.get('conversation_id')  # e.g. "direct_alice_bob"
-            text = data.get('text', '').strip()
-            if not conversation_id or not text:
+            text = (data.get('text') or '').strip()
+            if not isinstance(conversation_id, str) or not conversation_id or not text:
                 return
 
             msg_data = await _save_friend_message(self.user, conversation_id, text)
+            if msg_data is None:
+                # SECURITY: not a member of this conversation — drop silently.
+                return
 
-            # Determine partner
-            parts = conversation_id.replace('direct_', '').split('_')
-            peer_username = parts[1] if parts[0] == self.user.username else parts[0]
-            peer_id = await _cache_get(f'uid_{peer_username}')
+            # Determine partner (robust to usernames containing "_")
+            from room.access import direct_room_peer
+            peer = await sync_to_async(direct_room_peer)(conversation_id, self.user)
+            peer_id = peer.id if peer else None
 
             if peer_id:
                 peer_online = await _cache_get(f'user_online_{peer_id}')
@@ -1105,12 +1099,25 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.user = None
 
     async def connect(self):
+        self.room_group_name = None
         self.user = self.scope.get('user')
-        if not self.user or not self.user.is_authenticated:
-            # We can still allow anonymous, but TTL logic relies on user IDs or tracking
-            pass
-
         self.room_name = self.scope['url_route']['kwargs']['room_name']
+
+        # SECURITY: no anonymous sockets, and only members of the room may join its group.
+        # Previously anyone could connect to ws/chat/<any room>/ and read every live
+        # message and WebRTC signal, or inject messages as anyone.
+        if not self.user or not self.user.is_authenticated:
+            await self.close(code=4401)
+            return
+        from channels.db import database_sync_to_async
+        from room.access import get_accessible_room
+
+        allowed, _ = await database_sync_to_async(get_accessible_room)(
+            self.user, self.room_name, True
+        )
+        if not allowed:
+            await self.close(code=4403)
+            return
 
         import re
         safe_room_name = re.sub(r'[^a-zA-Z0-9_\-]', '', self.room_name)
@@ -1160,6 +1167,8 @@ class ChatConsumer(AsyncWebsocketConsumer):
         await self.accept()
 
     async def disconnect(self, close_code):
+        if not self.room_group_name:
+            return  # connection was rejected in connect()
         await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
 
         if self.user and self.user.is_authenticated:
@@ -1240,13 +1249,23 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 if calls: await _cache_set(f'session:{session_id}:calls', calls, timeout=600)
 
     async def receive(self, text_data):
-        data = json.loads(text_data)
+        if not self.room_group_name:
+            return
+        try:
+            data = json.loads(text_data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(data, dict):
+            return
         message_type = data.get('type')
+        # SECURITY: identity always comes from the authenticated socket, never from the client.
+        my_username = self.user.username
 
         if message_type == 'chat_message':
-            print(data['message'], flush = True)
-            message = data['message']
-            username = data.get('username', 'Anonymous')
+            message = data.get('message')
+            if not isinstance(message, str) or not message.strip():
+                return
+            username = my_username
 
             self.message_history.append(f'{username}: {message}')
             if len(self.message_history) > 10:
@@ -1307,9 +1326,9 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 self.room_group_name,
                 {
                     'type': 'video_signal',
-                    'signal': data['signal'],
+                    'signal': data.get('signal'),
                     'sender': self.channel_name,
-                    'username': data.get('username'),
+                    'username': my_username,
                     'mode': data.get('mode'),
                 }
             )
@@ -1317,7 +1336,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         elif message_type == 'end_call':
             await self.channel_layer.group_send(
                 self.room_group_name,
-                {'type': 'end_call', 'sender': self.channel_name, 'username': data.get('username')}
+                {'type': 'end_call', 'sender': self.channel_name, 'username': my_username}
             )
 
         elif message_type == 'force_exit':
@@ -1332,7 +1351,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                 {
                     'type': 'typing_indicator',
                     'event': message_type,
-                    'username': data.get('username', 'Anonymous'),
+                    'username': my_username,
                     'sender': self.channel_name,
                 }
             )

@@ -36,45 +36,23 @@ class StripeCheckoutView(APIView):
         if not price_id:
             return Response({"error": f"Stripe Price ID for {plan_type} not configured in backend."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+        # SECURITY: the old code here was "DUMMY UPGRADE LOGIC" that granted premium
+        # to anyone who called it, without any payment. Payments go through Razorpay
+        # (/api/wallet/...). Premium must only ever be granted after a verified payment
+        # (here: in StripeWebhookView after Stripe confirms checkout.session.completed).
         try:
-            profile = request.user.profile
-            
-            # --- DUMMY UPGRADE LOGIC ---
-            # 1. Set Subscription Expiry
-            expiry_date = timezone.now()
-            if plan_type == 'weekly':
-                expiry_date += timedelta(days=7)
-            else:
-                expiry_date += timedelta(days=30)
-                
-            profile.subscription_tier = plan_type
-            profile.subscription_expiry = expiry_date
-            
-            # 2. Instantly Replenish Quota
-            profile.daily_ai_llm_searches = 0
-            profile.daily_standard_searches = 0
-            profile.daily_roulette_searches = 0
-            profile.last_quota_reset_date = timezone.localtime(timezone.now()).date()
-            
-            profile.save()
-            
-            # 3. Log the Subscription
-            Subscription.objects.create(
-                user=request.user,
-                plan_type=plan_type,
-                stripe_subscription_id=f"dummy_sub_{timezone.now().timestamp()}",
-                status='active',
-                amount=5.99 if plan_type == 'weekly' else 19.99,
-                currency='usd',
-                ends_at=expiry_date
+            frontend = os.environ.get('FRONTEND_URL', 'https://www.glysmork.com')
+            session = stripe.checkout.Session.create(
+                mode='subscription',
+                line_items=[{'price': price_id, 'quantity': 1}],
+                client_reference_id=str(request.user.id),
+                metadata={'user_id': str(request.user.id), 'plan_type': plan_type},
+                success_url=frontend + '/pricing/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url=frontend + '/pricing',
             )
-            
-            # 4. Redirect straight to Success
-            success_url = os.environ.get('FRONTEND_URL', 'https://www.glysmork.com') + '/pricing/success?session_id=dummy_payment'
-            return Response({'checkout_url': success_url})
-            
+            return Response({'checkout_url': session.url})
         except Exception as e:
-            return Response({'error': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({'error': f'Could not start checkout: {e}'}, status=status.HTTP_502_BAD_GATEWAY)
 
 @method_decorator(csrf_exempt, name='dispatch')
 class StripeWebhookView(APIView):
@@ -84,6 +62,9 @@ class StripeWebhookView(APIView):
         payload = request.body
         sig_header = request.META.get('HTTP_STRIPE_SIGNATURE')
         endpoint_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
+        if not endpoint_secret or not sig_header:
+            # SECURITY: never process unsigned webhook payloads.
+            return HttpResponse(status=400)
 
         event = None
 

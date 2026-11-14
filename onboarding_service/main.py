@@ -11,6 +11,7 @@ from onboarding_service.models import UserProfile, Bucket, MatchResult, Attribut
 from onboarding_service.config import DEFAULT_BUCKETS
 from onboarding_service.llm import identify_buckets, get_chat_response, extract_structured_data
 from onboarding_service.pipeline import process_pipeline
+from onboarding_service.auth import current_user_id
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -27,9 +28,9 @@ app.add_middleware(
         "https://www.glysmork.com",
         "https://glysmork.com"
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,  # auth is via Bearer token, not cookies
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 # --- Startup Event to seed buckets ---
@@ -44,23 +45,26 @@ def startup_event():
 
 
 # --- Pydantic Models ---
+# NOTE: `user_id` in request bodies is ignored (kept optional for backwards compatibility);
+# the real user id always comes from the verified JWT via current_user_id().
 class IdentifyBucketsRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     opening_answer: str
 
 class ChatRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     message: str
     conversation_history: List[Dict[str, str]]
 
 class ExtractRequest(BaseModel):
-    user_id: int
+    user_id: Optional[int] = None
     full_conversation_history: List[Dict[str, str]]
 
 # --- API Endpoints ---
 
 @app.post("/onboarding/identify-buckets")
-def api_identify_buckets(req: IdentifyBucketsRequest, db: Session = Depends(get_db)):
+def api_identify_buckets(req: IdentifyBucketsRequest, db: Session = Depends(get_db),
+                         user_id: int = Depends(current_user_id)):
     """Part 3 - Bucket Identification"""
     existing = db.query(Bucket).all()
     bucket_dicts = [{"name": b.name, "description": b.description, "guidelines": b.guidelines} for b in existing]
@@ -95,7 +99,8 @@ def api_identify_buckets(req: IdentifyBucketsRequest, db: Session = Depends(get_
 
 
 @app.post("/onboarding/chat")
-def api_chat(req: ChatRequest, db: Session = Depends(get_db)):
+def api_chat(req: ChatRequest, db: Session = Depends(get_db),
+             user_id: int = Depends(current_user_id)):
     """Part 4 - The Onboarding Conversation"""
     
     # Handle the opening question (empty message = user just arrived)
@@ -118,9 +123,11 @@ def api_chat(req: ChatRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/onboarding/extract")
-def api_extract(req: ExtractRequest, db: Session = Depends(get_db)):
+def api_extract(req: ExtractRequest, db: Session = Depends(get_db),
+                user_id: int = Depends(current_user_id)):
     """Part 5 & 6 - Structured Extraction and Pipeline"""
-    
+    req.user_id = user_id  # SECURITY: always the authenticated user
+
     raw_data = extract_structured_data(req.full_conversation_history)
     
     # Process through standardizer pipeline
@@ -154,8 +161,11 @@ def api_extract(req: ExtractRequest, db: Session = Depends(get_db)):
 
 
 @app.get("/match/{user_id}")
-def api_match(user_id: int, db: Session = Depends(get_db)):
+def api_match(user_id: int, db: Session = Depends(get_db),
+              caller_id: int = Depends(current_user_id)):
     """Part 8 - Matching Engine"""
+    if caller_id != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     user_prof = db.query(UserProfile).filter(UserProfile.user_id == user_id).first()
     if not user_prof:
         raise HTTPException(status_code=404, detail="User profile not found")
