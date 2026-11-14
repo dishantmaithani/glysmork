@@ -2,6 +2,7 @@ import google.generativeai as genai
 import json
 import numpy as np
 import os
+import re
 from django.conf import settings
 from dotenv import load_dotenv
 from groq_client import groq_generate
@@ -24,13 +25,59 @@ MATCH_STATS = {
     "matches_returned": 0,
 }
 
-# Centralized scoring weights for ML optimization later (A/B testing, regression)
-SENTIMENT_WEIGHTS = {
-    "love": 2.2,
-    "like": 1.0,
-    "neutral": 0.2,
-    "hate": -3.0
-}
+# ---------------------------------------------------------------------------
+# Score calibration
+# ---------------------------------------------------------------------------
+# Raw Gemini cosine similarity is NOT a percentage: measured on gemini-embedding-001,
+# unrelated (concept, profile) pairs score 0.67-0.81 (median 0.74) and genuinely related
+# pairs 0.83-0.96. Using the raw value made every unrelated person look like a 70-80%
+# match. We map SIM_LOW -> 0 and SIM_HIGH -> 1 so the score means something.
+SIM_LOW = float(os.environ.get('MATCH_SIM_LOW', 0.77))
+SIM_HIGH = float(os.environ.get('MATCH_SIM_HIGH', 0.90))
+# Minimum calibrated score to be shown as a result
+MIN_MATCH_SCORE = float(os.environ.get('MATCH_MIN_SCORE', 0.35))
+# A leaf counts as "matched" (for the explanation text / exclusions) at this score
+MATCHED_LEAF = 0.5
+# In an AND, any wanted part scoring below this rules the person out
+AND_FAIL = 0.3
+
+# Filler words removed before comparing a whole sentence by meaning
+# ("someone who plays X" made every profile look ~50% similar).
+_FILLER = set("""
+a an the and or but both either i im i'm me my we our you your someone somebody anyone person people
+who whom that which what to for with about into in on at of from by as is are be being been
+want wants wanted looking look find need needs talk talking chat chatting discuss discussing
+like likes love loves enjoy enjoys interested interest knows know good plays play does do can could
+would should will just really very also some any new
+""".split())
+
+
+def _strip_filler(text):
+    words = re.findall(r"[a-z0-9+#']+", (text or '').lower())
+    kept = [w for w in words if w not in _FILLER]
+    return ' '.join(kept)
+
+
+def calibrate(cos):
+    """Map raw cosine similarity onto 0..1 where 0 = unrelated, 1 = strong match."""
+    if SIM_HIGH <= SIM_LOW:
+        return max(0.0, min(1.0, cos))
+    return max(0.0, min(1.0, (cos - SIM_LOW) / (SIM_HIGH - SIM_LOW)))
+
+
+def _word_match(term, text):
+    """Whole-word / whole-phrase match (case-insensitive).
+    Before, plain substring matching meant an interest like "AI" matched any query
+    containing those letters ("p-ai-nting", "det-ai-l") and scored 100%."""
+    term = (term or '').strip().lower()
+    text = (text or '').lower()
+    if len(term) < 2 or not text:
+        return False
+    return re.search(r'(?<![a-z0-9])' + re.escape(term) + r'(?![a-z0-9])', text) is not None
+
+
+# Intents that are system markers / button presses, not something a person typed.
+SYSTEM_INTENT_PREFIXES = ('room_ready', 'direct_connect', 'random opposite gender', 'persona match')
 
 # ---------------------------------------------------------------------------
 # Hard Filter Priorities (checked BEFORE any vector math to save CPU cycles)
@@ -169,20 +216,27 @@ def parse_intent_to_ast(intent_string):
     """
 
     try:
-        text = groq_generate(prompt)
+        # Low temperature: the same query should be understood the same way every time
+        text = groq_generate(prompt, temperature=0.1)
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
-        return json.loads(text)
+        # Tolerate a sentence before/after the JSON object
+        if not text.lstrip().startswith('{') and '{' in text and '}' in text:
+            text = text[text.index('{'): text.rindex('}') + 1]
+        ast = json.loads(text)
+        if not isinstance(ast, dict) or 'operator' not in ast:
+            raise ValueError('not an AST object')
+        return ast
     except Exception as e:
         print(f"AST Parsing Error: {e}")
-        print(f"Raw response: None")
         return {
             "operator": "LEAF",
             "type": "vector_concept",
             "field": "any",
-            "value": intent_string
+            "value": intent_string,
+            "sentiment": "like",
         }
 
 
@@ -190,128 +244,185 @@ def parse_intent_to_ast(intent_string):
 # Recursive AST Evaluator
 # ---------------------------------------------------------------------------
 
+def _vectors(emb):
+    """Yield numpy vectors from a stored embedding (flat list or list of lists)."""
+    if not emb or not isinstance(emb, list):
+        return
+    if isinstance(emb[0], list):
+        for v in emb:
+            if v:
+                yield np.array(v)
+    elif isinstance(emb[0], (int, float)):
+        yield np.array(emb)
+
+
 class MatchEvaluator:
+    """
+    Scores a parsed query (AST) against one profile. Every leaf returns a CALIBRATED score
+    in 0..1, so AND (min) / OR (max) / NOT (1 - x) behave like real logic.
+    """
     def __init__(self):
         # Cache embeddings for concepts during AST evaluation so we don't hit API repeatedly
         self.concept_embeddings = {}
+        self.matched_terms = []   # what matched for the current profile (for the explanation)
 
     def _get_cached_embedding(self, config_value):
         if config_value not in self.concept_embeddings:
             self.concept_embeddings[config_value] = get_embedding(config_value)
         return self.concept_embeddings[config_value]
 
+    def _concept_score(self, value, field, profile, semantic_only=False):
+        """How strongly `profile` matches the concept `value` (calibrated 0..1)."""
+        val = str(value or '').strip()
+        interests = [str(x) for x in (profile.interests or [])]
+        expertise = [str(x) for x in (profile.expertise_areas or [])]
+        bio = profile.bio or ''
+
+        # 1. Literal, WHOLE-WORD keyword match (either direction)
+        if field == 'interests':
+            items = interests
+        elif field == 'expertise':
+            items = expertise
+        else:
+            items = interests + expertise
+        if not semantic_only:
+            for item in items:
+                if _word_match(item, val) or _word_match(val, item):
+                    MATCH_STATS["fallback_keyword_used"] += 1
+                    return 1.0
+            if _word_match(val, bio):
+                MATCH_STATS["fallback_keyword_used"] += 1
+                return 0.8
+
+        # 2. Semantic similarity (embeddings), calibrated
+        concept_vector = self._get_cached_embedding(val)
+        if not concept_vector:
+            return 0.0
+        c_vec = np.array(concept_vector)
+        best = 0.0
+        targets = []
+        if field in ('interests', 'any'):
+            targets.append(getattr(profile, 'interests_embedding', None))
+        if field in ('expertise', 'any'):
+            targets.append(getattr(profile, 'expertise_embedding', None))
+        for emb in targets:
+            for v in _vectors(emb):
+                best = max(best, calibrate(cosine_similarity(c_vec, v)))
+        if best == 0.0 and field != 'any':
+            # Asked about interests but they only list it as expertise (or vice versa)
+            for emb in (getattr(profile, 'interests_embedding', None), getattr(profile, 'expertise_embedding', None)):
+                for v in _vectors(emb):
+                    best = max(best, 0.8 * calibrate(cosine_similarity(c_vec, v)))
+        return best
+
     def _evaluate_leaf(self, node, profile):
-        """
-        Evaluate a leaf node against a profile. Returns a float score.
-        """
+        """Evaluate a leaf. Positive sentiments return the match strength; 'hate' returns
+        how well the profile AVOIDS the concept (1 - match), so inside an AND it excludes
+        people who match it. (Before, hate multiplied by -3 and no one could ever match.)"""
         node_type = node.get("type")
         value = node.get("value")
         field = node.get("field", "any")
-        sentiment = node.get("sentiment", "like")
-        
-        # Look up empirical weight for AB Testing / ML models
-        weight = SENTIMENT_WEIGHTS.get(sentiment, 1.0)
-        
-        base_score = 0.0
+        sentiment = (node.get("sentiment") or "like").lower()
 
         if node_type == "exact_match":
-            val_lower = str(value).lower()
+            v = str(value or '')
             if field == "expertise":
-                items = [str(x).lower() for x in (profile.expertise_areas or [])]
-                base_score = 1.0 if val_lower in items else 0.0
+                base = 1.0 if any(_word_match(v, x) for x in (profile.expertise_areas or [])) else 0.0
             elif field == "interests":
-                items = [str(x).lower() for x in (profile.interests or [])]
-                base_score = 1.0 if val_lower in items else 0.0
+                base = 1.0 if any(_word_match(v, x) for x in (profile.interests or [])) else 0.0
             else:
-                bio_lower = (profile.bio or "").lower()
-                base_score = 1.0 if val_lower in bio_lower else 0.0
+                base = 1.0 if _word_match(v, profile.bio or '') else 0.0
+        else:
+            base = self._concept_score(value, field, profile)
 
-        elif node_type == "vector_concept":
-            concept_vector = self._get_cached_embedding(value)
-            
-            best_score = 0.0
-            
-            if concept_vector:
-                c_vec = np.array(concept_vector)
-                
-                def check_embeddings(emb_list):
-                    nonlocal best_score
-                    if not emb_list: return
-                    if isinstance(emb_list, list) and len(emb_list) > 0 and isinstance(emb_list[0], list):
-                        for u_vec_data in emb_list:
-                            score = cosine_similarity(c_vec, np.array(u_vec_data))
-                            if score > best_score:
-                                best_score = score
-                    elif isinstance(emb_list, list) and len(emb_list) > 0 and isinstance(emb_list[0], (int, float)):
-                        score = cosine_similarity(c_vec, np.array(emb_list))
-                        if score > best_score:
-                            best_score = score
-                
-                if field in ("interests", "any"):
-                    check_embeddings(getattr(profile, 'interests_embedding', None))
-                if field in ("expertise", "any"):
-                    check_embeddings(getattr(profile, 'expertise_embedding', None))
-                
-                if best_score == 0.0 and field != "any":
-                    check_embeddings(getattr(profile, 'interests_embedding', None))
-                    check_embeddings(getattr(profile, 'expertise_embedding', None))
-                    if best_score > 0:
-                        best_score *= 0.8
-                        
-            # --- ROBUST SUBSTRING FALLBACK ---
-            # If embedding matching failed or scored low, fallback to literal keyword match.
-            val_lower = str(value).lower()
-            bio_lower = (profile.bio or "").lower()
-            items = [str(x).lower() for x in (profile.interests or [])] + [str(x).lower() for x in (profile.expertise_areas or [])]
-            
-            used_fallback = False
-            # Massive boost if the literal term is in their interests or expertise
-            if any(val_lower in item or item in val_lower for item in items):
-                if best_score < 1.0:
-                    used_fallback = True
-                best_score = max(best_score, 1.0)
-            # Strong boost if the term is in their bio
-            elif val_lower in bio_lower:
-                if best_score < 0.8:
-                    used_fallback = True
-                best_score = max(best_score, 0.8)
-            
-            if used_fallback:
-                MATCH_STATS["fallback_keyword_used"] += 1
-
-            base_score = max(0.0, float(best_score))
-
-        return base_score * weight
+        if sentiment == 'hate':
+            return 1.0 - base
+        if base >= MATCHED_LEAF and value:
+            self.matched_terms.append(str(value))
+        # like / love / neutral all score by how well the person matches. (A "neutral"
+        # floor let people who match nothing at all show up at 50%.)
+        return base
 
     def evaluate_node(self, node, profile):
         """
-        Recursively evaluate the AST for a specific profile.
+        Recursively evaluate the AST for a specific profile. Always returns 0..1.
         """
-        if not node:
+        if not node or not isinstance(node, dict):
             return 0.0
 
-        op = node.get("operator")
-        
+        op = (node.get("operator") or "").upper()
+
         if op == "LEAF":
-            return self._evaluate_leaf(node, profile)
-            
+            return max(0.0, min(1.0, self._evaluate_leaf(node, profile)))
+
         elif op == "NOT":
-            child_score = self.evaluate_node(node.get("operand", {}), profile)
+            child = node.get("operand") or (node.get("operands") or [{}])[0]
+            # Don't list excluded things as "matched on"
+            saved = list(self.matched_terms)
+            child_score = self.evaluate_node(child, profile)
+            self.matched_terms = saved
             return 1.0 - child_score
-            
+
         elif op == "AND":
             operands = node.get("operands", [])
             if not operands: return 0.0
-            scores = [self.evaluate_node(child, profile) for child in operands]
-            return min(scores) if scores else 0.0
-            
+            pos, neg = [], []
+            for child in operands:
+                s = self.evaluate_node(child, profile)
+                (neg if _has_negation(child) else pos).append(s)
+            # NOT / hate parts are FILTERS only: a match on them excludes the person, but
+            # "not being a runner" is never a reason to show someone.
+            gate = min(neg) if neg else 1.0
+            if gate < AND_FAIL:
+                return 0.0
+            if not pos:
+                return gate
+            low = min(pos)
+            # A wanted part that clearly fails excludes the person; otherwise a "soft AND"
+            # so one so-so part doesn't sink someone who matches everything else
+            # (pure min() gave the obviously right Python dev only 49%).
+            # With 3+ parts, one weak part is tolerated — queries often mix a loose role
+            # word ("backend developer") with concrete skills ("Python", "system design").
+            fails = sum(1 for s in pos if s < AND_FAIL)
+            if fails > (1 if len(pos) >= 3 else 0):
+                return 0.0
+            soft = 0.5 * low + 0.5 * (sum(pos) / len(pos))
+            return soft * (0.5 + 0.5 * gate)
+
         elif op == "OR":
             operands = node.get("operands", [])
             if not operands: return 0.0
             scores = [self.evaluate_node(child, profile) for child in operands]
             return max(scores) if scores else 0.0
-            
+
         return 0.0
+
+    def score_profile(self, node, profile, whole_query=None):
+        """Evaluate and return (score, matched_terms) for one profile.
+        If `whole_query` is given (only for queries without NOT/hate), the meaning of the
+        full sentence acts as a floor — the parser sometimes drops words ("exploring new
+        countries" -> "new countries") and loses the match."""
+        self.matched_terms = []
+        score = self.evaluate_node(node, profile)
+        terms = list(dict.fromkeys(self.matched_terms))  # unique, keep order
+        core = _strip_filler(whole_query) if whole_query else ''
+        if core:
+            whole = 0.9 * self._concept_score(core, 'any', profile, semantic_only=True)
+            if whole > score:
+                score = whole
+        return score, terms
+
+
+def _has_negation(node):
+    """True if the AST contains a NOT or a 'hate' leaf anywhere."""
+    if not isinstance(node, dict):
+        return False
+    if (node.get('operator') or '').upper() == 'NOT' or (node.get('sentiment') or '').lower() == 'hate':
+        return True
+    kids = list(node.get('operands') or [])
+    if node.get('operand'):
+        kids.append(node['operand'])
+    return any(_has_negation(k) for k in kids)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +461,10 @@ def run_hybrid_discovery(intent_string, profiles_qs, searcher_profile=None):
     
     evaluator = MatchEvaluator()
     results = []
+    # Whole-sentence floor only for single-concept queries: it rescues words the parser
+    # dropped ("exploring new countries" -> "new countries"), but for AND/OR/NOT queries
+    # it would override the logic ("baking AND deep learning" matching a chef).
+    use_whole_query = (searcher_ast.get('operator') or '').upper() == 'LEAF' and not _has_negation(searcher_ast)
 
     # Pre-cache searcher vector for onboarding blend
     searcher_vec = _extract_profile_vec(searcher_profile) if searcher_profile else None
@@ -375,7 +490,10 @@ def run_hybrid_discovery(intent_string, profiles_qs, searcher_profile=None):
         # ---------------------------------------------------------------
         # STAGE 2: SEARCHER INTENT vs CANDIDATE PROFILE
         # ---------------------------------------------------------------
-        searcher_to_cand_score = evaluator.evaluate_node(searcher_ast, candidate)
+        searcher_to_cand_score, matched_terms = evaluator.score_profile(
+            searcher_ast, candidate,
+            whole_query=intent_string if use_whole_query else None,
+        )
 
         # ---------------------------------------------------------------
         # STAGE 3: MUTUAL INTENT (Candidate Intent vs Searcher Profile)
@@ -383,21 +501,29 @@ def run_hybrid_discovery(intent_string, profiles_qs, searcher_profile=None):
         cand_to_searcher_score = 0.0
         mutual_weight = 1.0  # full weight on searcher direction by default
 
-        cand_intent = getattr(candidate, 'current_intent', '') or ''
-        # Only evaluate mutual intent if the candidate has a real search intent
-        # (not a system string like ROOM_READY or a blank)
-        if (searcher_profile 
-            and cand_intent 
-            and not cand_intent.startswith('ROOM_READY') 
-            and not cand_intent.startswith('DIRECT_CONNECT')
-            and len(cand_intent) > 3):
-            
+        cand_intent = (getattr(candidate, 'current_intent', '') or '').strip()
+        # Only use the candidate's intent if it's something they actually TYPED recently.
+        # (Before: button presses like "Persona Match"/"Random Opposite Gender chat" and
+        #  weeks-old searches were parsed by the LLM and dragged real matches down.)
+        cand_recent = False
+        try:
+            from django.utils import timezone as _tz
+            from datetime import timedelta as _td
+            ls = getattr(candidate, 'last_seen', None)
+            cand_recent = bool(ls and ls >= _tz.now() - _td(minutes=30))
+        except Exception:
+            pass
+        if (searcher_profile
+            and cand_recent
+            and len(cand_intent) > 3
+            and not cand_intent.lower().startswith(SYSTEM_INTENT_PREFIXES)):
+
             # Parse from cache or fresh
             if cand_intent not in _candidate_ast_cache:
                 _candidate_ast_cache[cand_intent] = parse_intent_to_ast(cand_intent)
             cand_ast = _candidate_ast_cache[cand_intent]
-            
-            cand_to_searcher_score = evaluator.evaluate_node(cand_ast, searcher_profile)
+
+            cand_to_searcher_score, _ = MatchEvaluator().score_profile(cand_ast, searcher_profile)
             # Both directions matter: average them (50/50 mutual)
             mutual_weight = 0.5
 
@@ -416,7 +542,8 @@ def run_hybrid_discovery(intent_string, profiles_qs, searcher_profile=None):
         if searcher_vec is not None:
             cand_vec = _extract_profile_vec(candidate)
             if cand_vec is not None:
-                onboarding_sim = cosine_similarity(searcher_vec, cand_vec)
+                # calibrated like everything else (raw cosine is ~0.74 even for strangers)
+                onboarding_sim = calibrate(cosine_similarity(searcher_vec, cand_vec))
                 
                 # Dynamic weighting: if the user typed a long, specific query, their explicit intent 
                 # should dominate (preventing the "opposite match" penalty). If the query is generic, 
@@ -438,15 +565,75 @@ def run_hybrid_discovery(intent_string, profiles_qs, searcher_profile=None):
         # STAGE 5: THRESHOLD & COLLECT
         # ---------------------------------------------------------------
         MATCH_STATS["total_candidates_scored"] += 1
-        if final_score > 0.35:
+        # The searcher's own query must match on its own — mutual intent / profile blend
+        # can re-rank real matches but can't turn a non-match into a result.
+        if final_score >= MIN_MATCH_SCORE and searcher_to_cand_score >= MIN_MATCH_SCORE:
             results.append({
                 "profile": candidate,
                 "vector_score": final_score,
                 "searcher_to_cand": searcher_to_cand_score,
                 "cand_to_searcher": cand_to_searcher_score,
+                "matched_terms": matched_terms,
             })
 
     MATCH_STATS["matches_returned"] += len(results)
     # Sort descending by composite score
     results.sort(key=lambda x: x["vector_score"], reverse=True)
     return results, searcher_ast
+
+
+def profile_similarity(a, b):
+    """
+    How similar two people's profiles are (calibrated 0..1) + what they share.
+    Used by Persona Match ("Match based on my profile") and offline persona searches.
+    No LLM call — uses the stored interest/expertise embeddings and literal overlap.
+    """
+    a_items = [str(x) for x in (a.interests or [])] + [str(x) for x in (a.expertise_areas or [])]
+    b_items = [str(x) for x in (b.interests or [])] + [str(x) for x in (b.expertise_areas or [])]
+    shared = [x for x in a_items if any(_word_match(x, y) or _word_match(y, x) for y in b_items)]
+    shared = list(dict.fromkeys(shared))
+
+    best = 0.0
+    for ea in (getattr(a, 'interests_embedding', None), getattr(a, 'expertise_embedding', None)):
+        for va in _vectors(ea):
+            for eb in (getattr(b, 'interests_embedding', None), getattr(b, 'expertise_embedding', None)):
+                for vb in _vectors(eb):
+                    best = max(best, calibrate(cosine_similarity(va, vb)))
+    if shared:
+        # each literally shared interest is strong evidence
+        best = max(best, min(1.0, 0.6 + 0.2 * len(shared)))
+    return best, shared
+
+
+def rank_by_profile_similarity(searcher_profile, candidates):
+    """Rank candidates by similarity to the searcher's own profile (hard filters applied)."""
+    results = []
+    for cand in candidates:
+        passed, _ = passes_hard_filters(searcher_profile, cand)
+        if not passed:
+            continue
+        passed_rev, _ = passes_hard_filters(cand, searcher_profile)
+        if not passed_rev:
+            continue
+        score, shared = profile_similarity(searcher_profile, cand)
+        if score >= MIN_MATCH_SCORE:
+            results.append({"profile": cand, "vector_score": score, "matched_terms": shared})
+    results.sort(key=lambda x: x["vector_score"], reverse=True)
+    return results
+
+
+def speaks_any(profile, languages):
+    """True if the profile lists any of `languages` (case-insensitive).
+    Done in Python because SQLite (the production DB) doesn't support JSON `contains`
+    lookups — `languages__contains=[...]` crashed every search that used a language filter."""
+    if not languages:
+        return True
+    mine = {str(x).strip().lower() for x in (getattr(profile, 'languages', None) or [])}
+    return any(str(l).strip().lower() in mine for l in languages)
+
+
+def has_profile_data(profile):
+    """True if the profile has anything Persona Match can compare."""
+    return bool(profile.interests or profile.expertise_areas
+                or getattr(profile, 'interests_embedding', None)
+                or getattr(profile, 'expertise_embedding', None))

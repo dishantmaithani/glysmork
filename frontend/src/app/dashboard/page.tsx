@@ -370,25 +370,35 @@ export default function Dashboard() {
                 })
             });
             refreshProfile();
-            if (response.status === 'no_online_users') {
-                setIsMatching(false);
+            // Persona Match now returns a ranked list of people similar to YOUR profile
+            // (like Smart Search) instead of randomly pairing you with whoever clicked it.
+            if (response.status === 'discovery_results') {
+                if (response.message) sessionStorage.setItem('glysmork_discovery_notice', response.message);
+                sessionStorage.setItem('glysmork_discovery_results', JSON.stringify(response.results));
+                sessionStorage.setItem('glysmork_searching_intent', 'People like you');
+                window.location.href = '/discovery';
+            } else if (response.status === 'no_online_users') {
                 setPendingIntent(intentText);
                 setOfferOfflinePrompt(true);
             } else if (response.status === 'offline_activated') {
-                setIsMatching(false);
-                matchLockRef.current = false;
                 setIsOffline(false);
                 showNotification(response.message);
+            } else if (response.status === 'needs_onboarding') {
+                showNotification(response.message);
+                setTimeout(() => { window.location.href = '/onboarding?retake=true'; }, 1800);
+            } else if (response.status === 'quota_exceeded') {
+                showNotification("Free limit reached! Consider subscribing or upgrading your plan.");
+            } else if (response.status === 'no_results') {
+                showNotification(response.message || "Nobody similar to you is online right now.");
             } else if (response.match_found || response.room_name) {
-                setIsMatching(false);
-                matchLockRef.current = false;
                 window.location.href = `/chat/room?id=${response.room_name}&mode=${response.mode || modePref}`;
-            } else {
-                setSearchingIntent(intentText);
-                pollForMatch(intentText);
+            } else if (response.message) {
+                showNotification(response.message);
             }
         } catch (error) {
             console.error(error);
+        } finally {
+            // Always release the button (before, some branches left it locked until reload)
             setIsMatching(false);
             matchLockRef.current = false;
         }
@@ -499,6 +509,7 @@ export default function Dashboard() {
             } else if (response.status === 'discovery_results') {
                 setIsMatching(false);
                 matchLockRef.current = false;
+                if (response.message) sessionStorage.setItem('glysmork_discovery_notice', response.message);
                 sessionStorage.setItem('glysmork_discovery_results', JSON.stringify(response.results));
                 sessionStorage.setItem('glysmork_searching_intent', intentText);
                 window.location.href = '/discovery';

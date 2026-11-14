@@ -1,6 +1,12 @@
 """
 Shared Groq client for all LLM text generation.
 Gemini is kept separately for embeddings only (groq has no embedding API).
+
+The model is configurable with the GROQ_MODEL environment variable. Groq retires models
+from time to time (llama-3.3-70b-versatile was retired, which silently broke search
+parsing, the onboarding quiz analysis, the improvement bot and chat analysis), so if the
+configured model is rejected we automatically try the fallbacks below and remember the
+first one that works.
 """
 import os
 from groq import Groq
@@ -8,9 +14,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+
+# Kept for backwards compatibility (some scripts read/override it)
+GROQ_MODEL = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
 
 _client = None
+_working_model = None
+
 
 def get_groq_client() -> Groq:
     global _client
@@ -19,23 +31,56 @@ def get_groq_client() -> Groq:
     return _client
 
 
-def groq_generate(prompt: str, system: str = None) -> str:
+def _is_model_error(exc) -> bool:
+    msg = str(exc).lower()
+    return ('model' in msg and ('not found' in msg or 'does not exist' in msg
+                                or 'decommissioned' in msg or 'model_not_found' in msg))
+
+
+def _candidate_models():
+    seen, out = set(), []
+    for m in [_working_model, GROQ_MODEL] + FALLBACK_MODELS:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _complete(messages, temperature=0.7) -> str:
+    global _working_model
+    client = get_groq_client()
+    last_exc = None
+    for model in _candidate_models():
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+            if _working_model != model:
+                if _working_model is not None or model != GROQ_MODEL:
+                    print(f"groq_client: using model '{model}'")
+                _working_model = model
+            return (response.choices[0].message.content or '').strip()
+        except Exception as e:
+            last_exc = e
+            if _is_model_error(e):
+                print(f"groq_client: model '{model}' unavailable ({str(e)[:120]}); trying next")
+                continue
+            raise  # not a model problem (rate limit, network, auth) — let the caller decide
+    raise last_exc if last_exc else RuntimeError("No Groq model available")
+
+
+def groq_generate(prompt: str, system: str = None, temperature: float = 0.7) -> str:
     """
     Send a single-turn prompt to Groq and return the response text.
     Raises on error so callers can handle fallbacks themselves.
     """
-    client = get_groq_client()
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
-
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    return _complete(messages, temperature=temperature)
 
 
 def groq_chat(messages: list) -> str:
@@ -43,10 +88,4 @@ def groq_chat(messages: list) -> str:
     Send a multi-turn chat messages list to Groq and return the response text.
     Each message must be {"role": "user"|"assistant"|"system", "content": "..."}
     """
-    client = get_groq_client()
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=messages,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    return _complete(messages)

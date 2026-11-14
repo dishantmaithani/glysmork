@@ -11,6 +11,8 @@ export default function DiscoveryPage() {
     const [searchingIntent, setSearchingIntent] = useState<string>('');
     const [friendRequested, setFriendRequested] = useState<Set<string>>(new Set());
     const [ringingUsername, setRingingUsername] = useState<string | null>(null);
+    // e.g. "Offline search saved — we'll notify you if more people match"
+    const [notice, setNotice] = useState<string | null>(null);
 
     const getUsername = () => {
         const u = localStorage.getItem('user');
@@ -34,6 +36,11 @@ export default function DiscoveryPage() {
                 setSearchingIntent(storedIntent);
                 // Clear it so Dashboard doesn't restart search on back navigation
                 sessionStorage.removeItem('glysmork_searching_intent');
+            }
+            const storedNotice = sessionStorage.getItem('glysmork_discovery_notice');
+            if (storedNotice) {
+                setNotice(storedNotice);
+                sessionStorage.removeItem('glysmork_discovery_notice');
             }
         } catch { }
     }, []);
@@ -64,9 +71,14 @@ export default function DiscoveryPage() {
                             Network Results
                         </h2>
                         <div className="mt-4 flex flex-wrap items-center gap-4">
-                            {searchingIntent && <p className="text-slate-500 text-sm font-medium">AI synthesized candidates for: &quot;{searchingIntent}&quot;</p>}
+                            {searchingIntent && <p className="text-slate-500 text-sm font-medium">Best matches for: &quot;{searchingIntent}&quot;</p>}
                             <LocationPicker />
                         </div>
+                        {notice && (
+                            <p className="mt-3 text-sm font-medium text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-4 py-2 inline-block">
+                                {notice}
+                            </p>
+                        )}
                     </div>
                 </div>
 

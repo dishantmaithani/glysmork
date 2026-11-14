@@ -20,6 +20,7 @@ import os
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 
 import math
+import re
 
 def get_commonality_reason(p1, p2):
     """Calculates commonalities between two profiles based on structured data."""
@@ -283,12 +284,8 @@ class JoinMatchmakingView(APIView):
                 if country_filter:
                     query = query.filter(user__profile__country__in=country_filter)
 
-                # 3. Language filter (match ANY of the selected languages)
-                if language_filter:
-                    lang_q = Q()
-                    for lang in language_filter:
-                        lang_q |= Q(user__profile__languages__contains=[lang])
-                    query = query.filter(lang_q)
+                # 3. Language filter (match ANY of the selected languages) — applied in
+                #    Python below; SQLite can't do JSON `contains` (it crashed the search).
 
                 # --- 4. GEOSPATIAL FILTER (Geohash Optimization) ---
                 if distance_km > 0 and user.profile.latitude is not None and user.profile.longitude is not None:
@@ -307,7 +304,12 @@ class JoinMatchmakingView(APIView):
                     prefix = user.profile.geohash[:precision]
                     query = query.filter(user__profile__geohash__startswith=prefix)
 
-                potential_match = query.order_by('?').first()
+                if language_filter:
+                    from matchmaking.engine import speaks_any
+                    pool = list(query.select_related('user__profile').order_by('?')[:200])
+                    potential_match = next((l for l in pool if speaks_any(l.user.profile, language_filter)), None)
+                else:
+                    potential_match = query.order_by('?').first()
 
                 # 5. Final Distance verification (precise Haversine)
                 if potential_match and distance_km > 0:
@@ -337,25 +339,26 @@ class JoinMatchmakingView(APIView):
                     custom_reason = "Neural Link: Found in the Roulette matrix."
                     Loop.objects.filter(user__in=[user, match]).delete()
                     
-        elif intent.lower() == "persona match":
-            # Pure random match with ANYONE else in the loop who also selected persona match
-            potential_match = active_loop.filter(
-                user__profile__current_intent__iexact="persona match"
-            ).order_by('?').first()
-            if potential_match:
-                match = potential_match.user
-                custom_reason = "Neural Link: Persona match established."
-                Loop.objects.filter(user__in=[user, match]).delete()
         else:
-            # --- THE AI DISCOVERY ENGINE ---
-            # For personalized intent, we find a list of candidates instead of matching instantly.
+            # --- DISCOVERY ---
+            # Smart Search: your typed query (AI-parsed). Persona Match: people whose
+            # interests/expertise are most similar to YOUR profile. (Before, Persona Match
+            # randomly paired you with whoever else clicked the button.)
+            is_persona = intent.lower() == "persona match"
+            from matchmaking.engine import has_profile_data
+            if is_persona and not has_profile_data(user.profile):
+                return Response({
+                    "status": "needs_onboarding",
+                    "message": "Complete your profile analysis first so we know who you'd click with.",
+                })
             candidates_with_reasons = self.attempt_discovery(
                 user, intent,
                 country_filter=country_filter,
                 language_filter=language_filter,
                 distance_km=distance_km,
                 use_onboarding_data=use_onboarding_data,
-                is_offline=is_offline
+                is_offline=is_offline,
+                persona=is_persona,
             )
             if candidates_with_reasons == "NO_ONLINE_CANDIDATES":
                 return Response({
@@ -365,14 +368,23 @@ class JoinMatchmakingView(APIView):
             elif candidates_with_reasons:
                 user.profile.successful_searches += 1
                 user.profile.save(update_fields=['successful_searches'])
+                resp = {"status": "discovery_results", "results": candidates_with_reasons}
+                if is_offline:
+                    resp["message"] = ("Offline search saved — here are matches available now. "
+                                       "We'll notify you if more people match in the next 24 hours.")
+                return Response(resp)
+            elif is_offline:
+                # The search was saved above (OfflineSearch); tell the user instead of
+                # showing a confusing "zero matches" message.
                 return Response({
-                    "status": "discovery_results",
-                    "results": candidates_with_reasons
+                    "status": "offline_activated",
+                    "message": "Offline search saved. Nobody matches right now — we'll notify you "
+                               "when someone does (up to 4 matches in the next 24 hours).",
                 })
             else:
                 return Response({
                     "status": "no_results",
-                    "message": f"Zero neural nodes matched your intent: '{intent}'. Try broadening your search."
+                    "message": "Nobody matches that right now. Try different or broader words."
                 })
         
         if match:
@@ -422,7 +434,7 @@ class JoinMatchmakingView(APIView):
             "mode": intent.lower().split()[-1] if intent.lower().startswith("random opposite gender") else "chat"
         })
 
-    def attempt_discovery(self, user, intent, country_filter=None, language_filter=None, distance_km=0, use_onboarding_data=False, is_offline=False):
+    def attempt_discovery(self, user, intent, country_filter=None, language_filter=None, distance_km=0, use_onboarding_data=False, is_offline=False, persona=False):
         """
         AST Vector Search Engine: Parses intent into a strictly evaluated Boolean AST with numpy vector embeddings.
         """
@@ -483,14 +495,13 @@ class JoinMatchmakingView(APIView):
             candidates_qs = candidates_qs.filter(geohash__startswith=prefix)
 
 
-        # --- PRE-FILTER: Language (ANY of) ---
+        # --- FILTER: Language (ANY of) — in Python; SQLite can't do JSON `contains` ---
         if language_filter:
-            lang_q = Q()
-            for lang in language_filter:
-                lang_q |= Q(languages__contains=[lang])
-            candidates_qs = candidates_qs.filter(lang_q)
-
-        candidates = list(candidates_qs.order_by('-last_seen')[:40])
+            from matchmaking.engine import speaks_any
+            candidates = [p for p in candidates_qs.order_by('-last_seen')[:500]
+                          if speaks_any(p, language_filter)][:40]
+        else:
+            candidates = list(candidates_qs.order_by('-last_seen')[:40])
 
         # --- POST-FILTER: Distance (Haversine, Python-side) ---
         if distance_km > 0 and user_profile.latitude is not None and user_profile.longitude is not None:
@@ -504,23 +515,33 @@ class JoinMatchmakingView(APIView):
             print("DEBUG: Vector Search - No candidates found in database!")
             return "NO_ONLINE_CANDIDATES" if not is_offline else []
         
-        # --- NEW ENGINE: AST + Vector Similarity + Persona Scoring ---
-        from matchmaking.engine import run_hybrid_discovery
+        # --- ENGINE: AST + calibrated vector similarity (or profile similarity for Persona) ---
+        from matchmaking.engine import run_hybrid_discovery, rank_by_profile_similarity
         try:
-            print(f"DEBUG: Running engine for intent: {intent} (Onboarding Merge: {use_onboarding_data})")
-            matches, ast_tree = run_hybrid_discovery(intent, candidates, searcher_profile=user_profile if use_onboarding_data else None)
-            
+            print(f"DEBUG: Running engine for intent: {intent} (Onboarding Merge: {use_onboarding_data}, persona: {persona})")
+            if persona:
+                matches = rank_by_profile_similarity(user_profile, candidates)
+            else:
+                matches, ast_tree = run_hybrid_discovery(intent, candidates, searcher_profile=user_profile if use_onboarding_data else None)
+
             # Format results in descending score order
             results = []
             for match_data in matches[:5]:
                 p = match_data["profile"]
                 v_score = match_data["vector_score"]
-                
+                terms = match_data.get("matched_terms") or []
+                if persona:
+                    reason = (f"You both share: {', '.join(terms[:3])}." if terms
+                              else "Similar interests and expertise to yours.")
+                else:
+                    reason = (f"Matches your search on: {', '.join(terms[:3])}." if terms
+                              else "Related to what you searched for.")
+
                 results.append({
                     "id": p.user.id,
                     "username": p.user.username,
                     "score": min(99, round(v_score * 100)),
-                    "reason": f"Hybrid engine matched query with {round(v_score * 100)}% accuracy.",
+                    "reason": reason,
                     "bio": p.bio,
                     "persona_image": p.persona_image_url,
                     "is_online": p.is_online(),
@@ -531,10 +552,14 @@ class JoinMatchmakingView(APIView):
             return results
         except Exception as e:
             print(f"Hybrid Search Engine Error: {e}")
-            
+            if persona:
+                return []
+
             print("DEBUG: Falling back to standard database search due to AI failure.")
+            from matchmaking.engine import _word_match
             fallback_results = []
-            search_terms = intent.lower().split()
+            stop = {'the', 'and', 'who', 'with', 'for', 'want', 'someone', 'about', 'talk', 'person', 'that', 'knows'}
+            search_terms = [t for t in re.findall(r'[a-z0-9+#]+', intent.lower()) if t not in stop]
             
             for p in candidates:
                 score = 0
@@ -548,13 +573,13 @@ class JoinMatchmakingView(APIView):
                 
                 # Check for keyword matches
                 for term in search_terms:
-                    if len(term) > 2 and term in text_to_search:
+                    if len(term) > 2 and _word_match(term, text_to_search):
                         score += 30
                         if term not in match_tags:
                             match_tags.append(term)
-                
-                # Include users who match terms, or active users if search is broad
-                if score > 0 or len(intent) < 3:
+
+                # Only people who actually match a search word
+                if score > 0:
                     final_score = min(98, score + 45) # Baseline score
                     reason = f"Keyword match: {', '.join(match_tags)}" if match_tags else "Active network node."
                     
@@ -573,23 +598,9 @@ class JoinMatchmakingView(APIView):
             
             # Sort by score descending
             fallback_results.sort(key=lambda x: x['score'], reverse=True)
-            
-            # If no keyword matches found, just return the most recently active users as a last resort
-            if not fallback_results:
-                for p in list(candidates)[:5]:
-                    fallback_results.append({
-                        "id": p.user.id,
-                        "username": p.user.username,
-                        "score": 60,
-                        "reason": "General network match (no exact keywords found).",
-                        "bio": p.bio,
-                        "persona_image": p.persona_image_url,
-                        "is_online": p.is_online(),
-                        "match_tags": ["discovery"],
-                        "expertise": p.expertise_areas[:3] if p.expertise_areas else [],
-                        "interests": p.interests[:3] if p.interests else []
-                    })
-                    
+
+            # (Removed: when nothing matched, this used to return the 5 most recently active
+            #  users as fake "60% matches" — i.e. random results.)
             return fallback_results[:5]
 
 class FriendshipActionView(APIView):
