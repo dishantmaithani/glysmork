@@ -7,17 +7,9 @@ from asgiref.sync import async_to_sync
 from django.core.cache import cache
 import uuid
 
-def _cache_get_messages(room_name):
-    import json
-    raw = cache.get(f'session:{room_name}:messages') or '[]'
-    return json.loads(raw)
-
-def _cache_append_message(room_name, msg_data):
-    import json
-    msgs = _cache_get_messages(room_name)
-    msgs.append(msg_data)
-    # 24h expiration for active sessions
-    cache.set(f'session:{room_name}:messages', json.dumps(msgs), timeout=86400)
+# Shared with the websocket consumers so REST and sockets use the SAME cache key
+# (session:<id>:messages) and de-duplicate by client_id.
+from room.consumers import _cache_get_messages, _cache_append_message, session_messages_key
 from room.models import Message, Room
 from .serializers import MessageSerializer
 from django.utils import timezone
@@ -268,7 +260,7 @@ class MessageListView(APIView):
             session_id = room_name.replace('session_', '')
             from django.core.cache import cache
             
-            raw_msgs = cache.get(f'session:{session_id}:messages') or '[]'
+            raw_msgs = cache.get(session_messages_key(session_id)) or '[]'
             try:
                 msg_list = json.loads(raw_msgs)
             except:
@@ -343,20 +335,9 @@ class MessageListView(APIView):
         from calls.models import CallLog
         from django.db import models
         
-        # Case A: Friend chat room name is "direct_userA_userB"
-        if room_name.startswith('direct_'):
-            parts = room_name.split('_')
-            if len(parts) == 3:
-                u1_n, u2_n = parts[1], parts[2]
-                calls_qs = CallLog.objects.filter(
-                    (models.Q(caller__username=u1_n, receiver__username=u2_n) | 
-                     models.Q(caller__username=u2_n, receiver__username=u1_n))
-                ).order_by('-created_at')[:limit]
-                calls = list(calls_qs)
-                calls.reverse()
-        
-        # Case B: Ephemeral session room with precisely 2 users
-        elif room and room.users.count() == 2:
+        # Two-person rooms (direct or session): use the room's real members instead of
+        # splitting the name on "_" (which broke for usernames containing "_").
+        if room and room.users.count() == 2:
             room_users = list(room.users.all())
             user1, user2 = room_users[0], room_users[1]
             calls_qs = CallLog.objects.filter(

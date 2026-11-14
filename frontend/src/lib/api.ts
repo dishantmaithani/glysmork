@@ -27,6 +27,20 @@ const getApiBase = () => {
 
 export const API_BASE_URL = getApiBase();
 
+/**
+ * WebSocket origin derived from the API base (https://api.glysmork.com/api -> wss://api.glysmork.com).
+ * Previously each page guessed the host itself and fell back to the *frontend* host
+ * (www.glysmork.com on Vercel), which cannot serve websockets.
+ */
+export function getWsBase(): string {
+    try {
+        const u = new URL(API_BASE_URL);
+        return `${u.protocol === 'https:' ? 'wss:' : 'ws:'}//${u.host}`;
+    } catch {
+        return 'wss://api.glysmork.com';
+    }
+}
+
 export function getMediaUrl(path: string | null | undefined): string {
     if (!path) return '';
     // Upgrade insecure http to https to prevent mixed-content blocking

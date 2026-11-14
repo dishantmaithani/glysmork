@@ -6,7 +6,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { ArrowLeft, Send, Phone, PhoneOff, Video, VideoOff, CheckCheck, Trash2, UserPlus, Check, MoreHorizontal, ShieldAlert, Download } from 'lucide-react';
 import Link from 'next/link';
 import { useCall } from '@/components/CallProvider';
-import { fetchApi, getMediaUrl } from '@/lib/api';
+import { fetchApi, getMediaUrl, getWsBase, API_BASE_URL } from '@/lib/api';
 
 type DmMessage = {
     id: any;
@@ -49,6 +49,10 @@ export default function DMPage() {
     const wsRef = useRef<WebSocket | null>(null);
     const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
     const lastSendTimeRef = useRef(0);
+    // Socket lifecycle: reconnect after network blips/deploys, but not after we close it on purpose
+    const wsClosedByUsRef = useRef(false);
+    const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const wsRetryDelayRef = useRef(2000);
 
     const roomName = myUsername
         ? (friend.startsWith('session_') ? friend : `direct_${[myUsername, friend].sort().join('_')}`)
@@ -69,6 +73,7 @@ export default function DMPage() {
         if (!roomName || !myUsername) return;
 
         loadMessages();
+        wsClosedByUsRef.current = false;
         connectWS();
         clearNotifications();
 
@@ -101,8 +106,10 @@ export default function DMPage() {
             setFriendStatus('none');
         }
 
-        return () => { 
-            wsRef.current?.close(); 
+        return () => {
+            wsClosedByUsRef.current = true;
+            if (wsReconnectTimerRef.current) clearTimeout(wsReconnectTimerRef.current);
+            wsRef.current?.close();
             if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
         };
     }, [roomName, myUsername]);
@@ -157,8 +164,14 @@ export default function DMPage() {
     const handleDownloadTranscript = async () => {
         if (!roomName) return;
         try {
-            const res = await fetchApi(`/room/${roomName}/transcript/`);
-            const blob = new Blob([res], { type: 'text/plain' });
+            // The endpoint returns plain text, so fetch it raw (fetchApi always parses JSON,
+            // which made every transcript download fail).
+            const token = localStorage.getItem('access_token');
+            const resp = await fetch(`${API_BASE_URL}/room/${roomName}/transcript/`, {
+                headers: token ? { Authorization: `Bearer ${token}` } : {},
+            });
+            if (!resp.ok) throw new Error(`Transcript download failed: ${resp.status}`);
+            const blob = await resp.blob();
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -188,22 +201,35 @@ export default function DMPage() {
     };
 
     const connectWS = () => {
-        if (wsRef.current) wsRef.current.close();
+        if (wsClosedByUsRef.current) return;
+        if (wsRef.current) {
+            wsRef.current.onclose = null; // replacing it on purpose — don't trigger a reconnect
+            wsRef.current.close();
+        }
         const token = localStorage.getItem('access_token');
-        
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const host = window.location.hostname;
-        const isLocal = host === 'localhost' || host === '127.0.0.1';
-        const wsHost = process.env.NEXT_PUBLIC_API_URL 
-            ? new URL(process.env.NEXT_PUBLIC_API_URL).host 
-            : (isLocal ? `${host}:8000` : host);
 
-        const wsUrl = `${wsProtocol}//${wsHost}/ws/chat/${roomName}/?token=${token}`;
-        const ws = new WebSocket(wsUrl);
+        const ws = new WebSocket(`${getWsBase()}/ws/chat/${roomName}/?token=${token}`);
         wsRef.current = ws;
 
+        ws.onopen = () => {
+            const wasReconnect = wsRetryDelayRef.current > 2000;
+            wsRetryDelayRef.current = 2000;
+            // Catch up on anything sent while we were disconnected
+            if (wasReconnect) loadMessages();
+        };
+
+        // Before: no reconnect at all, so after any network blip or server restart
+        // incoming DMs silently stopped until the page was reloaded.
+        ws.onclose = () => {
+            if (wsClosedByUsRef.current || wsRef.current !== ws) return;
+            if (wsReconnectTimerRef.current) clearTimeout(wsReconnectTimerRef.current);
+            wsReconnectTimerRef.current = setTimeout(connectWS, wsRetryDelayRef.current);
+            wsRetryDelayRef.current = Math.min(wsRetryDelayRef.current * 2, 30000);
+        };
+
         ws.onmessage = (e) => {
-            const data = JSON.parse(e.data);
+            let data: any;
+            try { data = JSON.parse(e.data); } catch { return; }
             
             if (data.type === 'chat_message') {
                 const fallbackId = Date.now() + Math.random();
@@ -323,6 +349,8 @@ export default function DMPage() {
 
     const deleteForEveryone = async (msgId: number) => {
         setContextMenu(null);
+        // Optimistic messages have a temporary float id until the server confirms them
+        if (!Number.isInteger(msgId)) return;
         try {
             await fetchApi(`/room/messages/${msgId}/action/`, {
                 method: 'POST',
@@ -437,7 +465,7 @@ export default function DMPage() {
                                 const durationDisp = msg.call_duration ? `${Math.floor(msg.call_duration/60)}:${(msg.call_duration%60).toString().padStart(2, '0')}` : '';
                                 
                                 return (
-                                    <motion.div key={msg.id || idx} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-center my-4">
+                                    <motion.div key={msg.client_id || msg.id || idx} initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex justify-center my-4">
                                         <div className="bg-white border border-slate-200/80 shadow-sm rounded-[20px] px-5 py-3 flex items-center gap-4">
                                             <div className={`p-2.5 rounded-full bg-slate-50 ${statusColor}`}>
                                                 <Icon className="w-4 h-4" />
@@ -456,7 +484,7 @@ export default function DMPage() {
                             }
 
                             return (
-                                <motion.div key={msg.id || idx} initial={{ opacity: 0, x: isMe ? 10 : -10 }} animate={{ opacity: 1, x: 0 }} className={`flex items-end gap-2 ${isMe ? 'justify-end' : 'justify-start'}`}>
+                                <motion.div key={msg.client_id || msg.id || idx} initial={{ opacity: 0, x: isMe ? 10 : -10 }} animate={{ opacity: 1, x: 0 }} className={`flex items-end gap-2 ${isMe ? 'justify-end' : 'justify-start'}`}>
                                     {/* Avatar for incoming messages */}
                                     {!isMe && (
                                         <div className="w-7 h-7 rounded-full overflow-hidden bg-slate-900 flex items-center justify-center shrink-0 mb-1 shadow-sm">

@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { Send, LogOut, UserPlus, Phone, Video, VideoOff, Check, AlertTriangle, Fingerprint, Activity, Terminal, ArrowLeft, ShieldAlert } from 'lucide-react';
 import Logo from '@/components/Logo';
 import { useCall } from '@/components/CallProvider';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getWsBase } from '@/lib/api';
 import { useRouter } from 'next/navigation';
 
 interface ChatMessage {
@@ -42,6 +42,10 @@ export default function ChatRoom() {
     const [matchReason, setMatchReason] = useState<string | null>(null);
 
     const { startCall, endCall } = useCall();
+    // Keep endCall out of effect deps: the socket effect's cleanup calls it, and any
+    // re-run of that effect used to hang up the active call.
+    const endCallRef = useRef(endCall);
+    endCallRef.current = endCall;
     const router = useRouter();
 
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -173,17 +177,12 @@ export default function ChatRoom() {
 
         try {
             const token = localStorage.getItem('access_token');
-            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const host = window.location.hostname;
-            const isLocal = host === 'localhost' || host === '127.0.0.1';
-            const wsHost = process.env.NEXT_PUBLIC_API_URL 
-                ? new URL(process.env.NEXT_PUBLIC_API_URL).host 
-                : (isLocal ? `${host}:8000` : host);
-            const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/chat/${roomId}/?token=${token}`);
+            const ws = new WebSocket(`${getWsBase()}/ws/chat/${roomId}/?token=${token}`);
             wsRef.current = ws;
 
             ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
+                let data: any;
+                try { data = JSON.parse(event.data); } catch { return; }
                 if (data.type === 'chat_message') {
                     setMessages(prev => {
                         if (data.id && prev.some(m => m.id === data.id)) return prev;
@@ -243,10 +242,10 @@ export default function ChatRoom() {
             clearInterval(pollInterval);
             clearInterval(statusInt);
             if (roomId?.startsWith('session_')) {
-                endCall();
+                endCallRef.current();
             }
         };
-    }, [roomId, currentUser, fetchAndMergeMessages, endCall]);
+    }, [roomId, currentUser, fetchAndMergeMessages]);
 
 
 
@@ -552,7 +551,7 @@ export default function ChatRoom() {
                             const durationDisp = msg.call_duration ? `${Math.floor(msg.call_duration/60)}:${(msg.call_duration%60).toString().padStart(2, '0')}` : '';
 
                             return (
-                                <motion.div key={msg.id || index} initial={{ opacity: 0 }} animate={{ opacity: 1 }} layout className="flex justify-center w-full my-2">
+                                <motion.div key={msg.client_id || msg.id || index} initial={{ opacity: 0 }} animate={{ opacity: 1 }} layout className="flex justify-center w-full my-2">
                                     <div className="bg-white border border-slate-200 rounded-xl px-4 py-2 flex items-center gap-3 shadow-sm text-sm">
                                         <div className={`p-1.5 rounded-full bg-slate-50 ${statusColor}`}>
                                             <Icon className="w-3.5 h-3.5" />
@@ -567,7 +566,7 @@ export default function ChatRoom() {
 
                         return (
                             <motion.div
-                                key={msg.id || index}
+                                key={msg.client_id || msg.id || index}
                                 initial={{ opacity: 0, y: 10 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 layout

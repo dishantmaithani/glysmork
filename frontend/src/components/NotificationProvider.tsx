@@ -1,9 +1,19 @@
 "use client";
 
-import React, { createContext, useContext, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { X, MessageSquare } from 'lucide-react';
-import { fetchApi } from '@/lib/api';
+import { fetchApi, getWsBase } from '@/lib/api';
+
+// Notifications already toasted in this browser tab (survives full-page navigations,
+// which this app does a lot — before, every page load re-toasted every unread notification).
+const SEEN_KEY = 'glysmork_seen_notifs';
+const loadSeen = (): Set<string> => {
+    try { return new Set(JSON.parse(sessionStorage.getItem(SEEN_KEY) || '[]')); } catch { return new Set(); }
+};
+const saveSeen = (s: Set<string>) => {
+    try { sessionStorage.setItem(SEEN_KEY, JSON.stringify(Array.from(s).slice(-200))); } catch { }
+};
 
 interface NotificationContextProps {
     sendSignal: (type: string, payload: any) => void;
@@ -106,26 +116,32 @@ export default function NotificationProvider({ children }: { children: React.Rea
             return;
         }
 
-        const host = window.location.hostname;
-        const isLocal = host === 'localhost' || host === '127.0.0.1';
-        const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsHost = process.env.NEXT_PUBLIC_API_URL
-            ? new URL(process.env.NEXT_PUBLIC_API_URL).host
-            : (isLocal ? `${host}:8000` : host);
+        const wsBase = getWsBase();
+        let closedByUs = false;            // set on unmount: don't reconnect after an intentional close
+        let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+        let retryDelay = 2000;             // exponential backoff, capped below
+
+        const scheduleReconnect = () => {
+            if (closedByUs) return;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(connect, retryDelay);
+            retryDelay = Math.min(retryDelay * 2, 30000);
+        };
 
         const connect = () => {
+            if (closedByUs) return;
             const currentToken = localStorage.getItem('access_token');
             if (!currentToken) {
-                setTimeout(connect, 2000);
+                scheduleReconnect();
                 return;
             }
 
-            console.log(`Notification WS: Connecting to ${wsHost}...`);
-            const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/notifications/?token=${currentToken}`);
+            const ws = new WebSocket(`${wsBase}/ws/notifications/?token=${currentToken}`);
 
             ws.onopen = () => {
-                console.log("Notification WS: CONNECTED");
+                retryDelay = 2000;
                 setIsOnline(true);
+                if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
                 pingIntervalRef.current = setInterval(() => {
                     if (ws.readyState === WebSocket.OPEN) {
                         ws.send(JSON.stringify({ type: 'ping' }));
@@ -164,9 +180,10 @@ export default function NotificationProvider({ children }: { children: React.Rea
             };
 
             ws.onclose = () => {
+                if (wsRef.current === ws) wsRef.current = null;
                 setIsOnline(false);
                 if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
-                setTimeout(connect, 5000);
+                scheduleReconnect();   // reads a fresh token on the next attempt
             };
 
             wsRef.current = ws;
@@ -175,23 +192,26 @@ export default function NotificationProvider({ children }: { children: React.Rea
         connect();
 
         // FAILSAFE: Polling fallback for offline notifications
-        let seenNotifTimestamps = new Set<string>();
+        const seen = loadSeen();
         const poll = async () => {
             if (!user?.username) return;
             try {
-                const data = await fetchApi(`/matchmaking/notifications/?username=${encodeURIComponent(user.username)}`);
+                const data = await fetchApi(`/matchmaking/notifications/`);
                 const notifs = data.notifications || [];
+                let changed = false;
                 for (const notif of notifs) {
                     const notifSender = notif.sender || notif.from_user;
                     if (notifSender && notifSender !== user.username) {
-                        const stampKey = `${notifSender}_${notif.created_at || notif.id}_${notif.message}`;
-                        if (!seenNotifTimestamps.has(stampKey)) {
-                            seenNotifTimestamps.add(stampKey);
+                        const stampKey = `${notif.id}_${notif.created_at || ''}`;
+                        if (!seen.has(stampKey)) {
+                            seen.add(stampKey);
+                            changed = true;
                             showToast(notifSender, notif.message || 'sent you a message', 'Message');
                             window.dispatchEvent(new CustomEvent('sys_friend_message', { detail: { type: 'friend_message' } }));
                         }
                     }
                 }
+                if (changed) saveSeen(seen);
             } catch (e) {
                 // Silently fail — WS is primary
             }
@@ -201,13 +221,16 @@ export default function NotificationProvider({ children }: { children: React.Rea
         poll();
 
         return () => {
+            closedByUs = true;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
             if (wsRef.current) wsRef.current.close();
             if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
             clearInterval(pollInterval);
         };
     }, []);
 
-    const sendSignal = (type: string, payload: any) => {
+    // Stable identity: CallProvider's timers/effects must not restart on every render.
+    const sendSignal = useCallback((type: string, payload: any) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             const data = { type, ...payload };
             window.dispatchEvent(new CustomEvent('ws_debug_send', { detail: data }));
@@ -215,10 +238,12 @@ export default function NotificationProvider({ children }: { children: React.Rea
         } else {
             console.warn("Cannot send signal, WS not open");
         }
-    };
+    }, []);
+
+    const contextValue = useMemo(() => ({ sendSignal, onlineStatus: isOnline }), [sendSignal, isOnline]);
 
     return (
-        <NotificationContext.Provider value={{ sendSignal, onlineStatus: isOnline }}>
+        <NotificationContext.Provider value={contextValue}>
             {children}
 
             {/* Global Consolidated Toasts */}

@@ -29,19 +29,34 @@ def _cache():
     from django.core.cache import cache
     return cache
 
+def session_messages_key(room_or_session_id):
+    """Single source of truth for the ephemeral session message cache key.
+    Accepts either 'session_<id>' (room name) or the bare '<id>'.
+    (Before: some writers used session:session_<id>:messages and readers used
+    session:<id>:messages, so session history vanished on reload.)"""
+    sid = str(room_or_session_id)
+    if sid.startswith('session_'):
+        sid = sid[len('session_'):]
+    return f'session:{sid}:messages'
+
+
 def _cache_get_messages(room_name):
     import json
-    raw = _cache().get(f'session:{room_name}:messages') or '[]'
+    raw = _cache().get(session_messages_key(room_name)) or '[]'
     try:
         return json.loads(raw)
-    except:
+    except Exception:
         return []
 
 def _cache_append_message(room_name, msg_data):
     import json
     msgs = _cache_get_messages(room_name)
+    # The frontend sends each message over the socket AND via REST — store it once.
+    cid = msg_data.get('client_id')
+    if cid and any(m.get('client_id') == cid for m in msgs):
+        return
     msgs.append(msg_data)
-    _cache().set(f'session:{room_name}:messages', json.dumps(msgs), timeout=86400)
+    _cache().set(session_messages_key(room_name), json.dumps(msgs), timeout=86400)
 
 
 @sync_to_async
@@ -56,7 +71,9 @@ def _cache_set(key, val, timeout=None):
 
 @sync_to_async
 def _cache_delete(key):
-    _cache().delete(key)
+    # Returns True only for the caller that actually removed the key (Django >= 3.1),
+    # which lets concurrent handlers "claim" a call exactly once.
+    return bool(_cache().delete(key))
 
 
 @sync_to_async
@@ -106,7 +123,8 @@ def _is_user_premium(username):
     from django.contrib.auth.models import User
     try:
         user = User.objects.get(username=username)
-        return user.profile.subscription_tier in ['plus', 'premium', 'elite']
+        # Tiers are free/weekly/monthly (not plus/premium/elite) — use the model's own check.
+        return user.profile.is_premium
     except Exception:
         return False
 
@@ -121,14 +139,8 @@ def _check_and_deduct_ai_quota(username):
         user = User.objects.get(username=username)
         profile = user.profile
         
-        # Determine quota limit based on subscription tier
-        tier = profile.subscription_tier
-        if tier == 'free':
-            limit = 4
-        elif tier in ['plus', 'premium', 'elite']:
-            limit = 40
-        else:
-            limit = 4
+        # Determine quota limit based on subscription (premium = 40, free = 4)
+        limit = 40 if profile.is_premium else 4
             
         if profile.daily_ai_llm_searches < limit:
             profile.daily_ai_llm_searches += 1
@@ -412,6 +424,11 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         # Mark offline immediately
         await _cache_delete(f'user_online_{self.user.id}')
 
+        # If they were in a call, end it unless they reconnect within the grace period
+        active_call = await _cache_get(f'in_call_{self.user.id}')
+        if active_call:
+            asyncio.create_task(self._end_call_if_still_gone(active_call))
+
         # Update last_seen in DB
         @sync_to_async
         def _update_last_seen():
@@ -506,6 +523,9 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if not raw:
                 return
             session = json.loads(raw)
+            # Only the person the request was sent to can accept it
+            if str(session.get('to_user_id')) != str(self.user.id):
+                return
             session['status'] = 'active'
             await _cache_set(f'session:{session_id}', json.dumps(session), timeout=3600)
 
@@ -529,6 +549,8 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if not raw:
                 return
             session = json.loads(raw)
+            if str(session.get('to_user_id')) != str(self.user.id):
+                return
             await _cache_delete(f'session:{session_id}')
 
             await self.channel_layer.group_send(
@@ -637,21 +659,18 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
         elif msg_type == 'read_receipt':
             context_id = data.get('session_id') or data.get('conversation_id')
-            if not context_id:
+            if not isinstance(context_id, str) or not context_id:
                 return
-            
-            # 1. Update DB for friend chats
-            has_changes = False
+
             if context_id.startswith('direct_'):
+                # Only a member of the conversation can mark it read (works for usernames with "_")
+                from room.access import direct_room_peer
+                peer = await sync_to_async(direct_room_peer)(context_id, self.user)
+                if peer is None:
+                    return
                 has_changes = await _set_messages_read(context_id, self.user)
-            
-            # 2. Broadcast to peer
-            # Extract peer_username for friend chats
-            if context_id.startswith('direct_'):
-                parts = context_id.replace('direct_', '').split('_')
-                peer_username = parts[1] if parts[0] == self.user.username else parts[0]
-                peer_id = await _cache_get(f'uid_{peer_username}')
-                if peer_id and has_changes:
+                peer_id = peer.id
+                if has_changes:
                     await self.channel_layer.group_send(
                         f'user_{peer_id}',
                         {
@@ -660,14 +679,18 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                             'read_by': self.user.username,
                         }
                     )
-            elif context_id.startswith('session_'):
-                # For sessions, just forward it (ephemeral)
-                raw = await _cache_get(f'session:{context_id}')
+            else:
+                # For sessions, just forward it (ephemeral). Accept 'session_<id>' or bare '<id>'.
+                sid = context_id[len('session_'):] if context_id.startswith('session_') else context_id
+                raw = await _cache_get(f'session:{sid}:meta') or await _cache_get(f'session:{sid}')
                 if raw:
                     session = json.loads(raw)
+                    ids = (str(session.get('from_user_id')), str(session.get('to_user_id')))
+                    if str(self.user.id) not in ids:
+                        return
                     peer_id = (
                         session['to_user_id']
-                        if self.user.id == session['from_user_id']
+                        if str(self.user.id) == str(session['from_user_id'])
                         else session['from_user_id']
                     )
                     await self.channel_layer.group_send(
@@ -696,6 +719,23 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if not to_user_id:
                 print(f"--- WEBRTC [call_offer] FAILED: Could not resolve to_user_id for username {to_username}")
                 return
+            try:
+                to_user_id = int(to_user_id)
+            except (TypeError, ValueError):
+                return
+            if to_user_id == self.user.id:
+                return
+            callee = await _get_user_by_id(to_user_id)
+            if callee is None:
+                return
+            # Call ids must be UUIDs (CallLog.call_id is a UUIDField), and a client may
+            # never reuse/hijack an existing call id.
+            try:
+                call_id = str(uuid.UUID(str(call_id)))
+            except (ValueError, TypeError):
+                call_id = str(uuid.uuid4())
+            if await _cache_get(f'call:{call_id}'):
+                call_id = str(uuid.uuid4())
 
             receiver_online = await _cache_get(f'user_online_{to_user_id}')
             if not receiver_online:
@@ -723,11 +763,14 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                 'caller_id': self.user.id,
                 'caller_username': self.user.username,
                 'callee_id': to_user_id,
+                'callee_username': callee.username,
                 'mode': mode,
-                'started_at': None,
+                'offered_at': datetime.now(dt_tz.utc).isoformat(),
+                'connected_at': None,   # set when the callee answers
                 'context_id': context_id,
             }
-            await _cache_set(f'call:{call_id}', json.dumps(call_meta), timeout=30)
+            # Generous TTL: the 30s no-answer rule is enforced by _call_timeout, not by expiry
+            await _cache_set(f'call:{call_id}', json.dumps(call_meta), timeout=120)
             
             # Fetch caller profile data
             @sync_to_async
@@ -772,6 +815,9 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                 print(f"--- WEBRTC [call_answer] ERROR: Call {call_id} not found in Redis!")
                 return
             call_meta = json.loads(raw)
+            # Only the person being called can answer, and only once
+            if call_meta.get('callee_id') != self.user.id or call_meta.get('connected_at'):
+                return
             call_meta['connected_at'] = datetime.now(dt_tz.utc).isoformat()
             await _cache_set(f'call:{call_id}', json.dumps(call_meta), timeout=7200)
 
@@ -796,35 +842,13 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if not raw:
                 return
             call_meta = json.loads(raw)
-            await _cache_delete(f'call:{call_id}')
-
-            # Save declined call log
-            await _save_call_log(
-                call_id=call_id,
-                caller_username=call_meta.get('caller_username', ''),
-                receiver_username=self.user.username,
-                mode=call_meta.get('mode', 'video'),
-                status='declined',
-                started_at=None,
-                ended_at=datetime.now(dt_tz.utc),
-                duration_seconds=0,
-                context_id=call_meta.get('context_id')
-            )
-
-            # Identify who gets the decline signal
-            target_peer_id = (
-                call_meta['callee_id'] 
-                if self.user.id == call_meta['caller_id'] 
-                else call_meta['caller_id']
-            )
-            
-            await self.channel_layer.group_send(
-                f'user_{target_peer_id}',
-                {
-                    'type': 'call_declined_signal',
-                    'call_id': call_id,
-                }
-            )
+            if self.user.id not in (call_meta.get('caller_id'), call_meta.get('callee_id')):
+                return
+            if call_meta.get('connected_at'):
+                # Already answered: a "decline" now means hang up.
+                await self._finish_call(call_id, call_meta, reason='hangup')
+                return
+            await self._finish_call(call_id, call_meta, reason='declined')
 
         elif msg_type == 'ice_candidate':
             call_id = data.get('call_id')
@@ -838,7 +862,9 @@ class NotificationConsumer(AsyncWebsocketConsumer):
                 return
             
             call_meta = json.loads(raw)
-            
+            if self.user.id not in (call_meta.get('caller_id'), call_meta.get('callee_id')):
+                return
+
             # Identify who gets the ICE candidate
             target_peer_id = (
                 call_meta['callee_id'] 
@@ -862,45 +888,13 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             if not raw:
                 return
             call_meta = json.loads(raw)
-            await _cache_delete(f'call:{call_id}')
-
-            # Clear in_call flags
-            await _cache_delete(f'in_call_{call_meta["caller_id"]}')
-            await _cache_delete(f'in_call_{call_meta["callee_id"]}')
-
-            now = datetime.now(dt_tz.utc)
-            duration_seconds = 0
-            # Use connected_at for duration if available, otherwise fallback to started_at
-            start_time_str = call_meta.get('connected_at') or call_meta.get('started_at')
-            if start_time_str:
-                start_time = datetime.fromisoformat(start_time_str)
-                duration_seconds = max(0, int((now - start_time).total_seconds()))
-            
-            started_at = datetime.fromisoformat(call_meta['started_at']) if call_meta.get('started_at') else now
-
-            await _save_call_log(
-                call_id=call_id,
-                caller_username=call_meta.get('caller_username', ''),
-                receiver_username=self.user.username
-                    if self.user.id == call_meta.get('callee_id')
-                    else call_meta.get('callee_username', ''),
-                mode=call_meta.get('mode', 'video'),
-                status='ended' if started_at else 'cancelled',
-                started_at=started_at,
-                ended_at=now,
-                duration_seconds=duration_seconds,
-                context_id=call_meta.get('context_id')
+            if self.user.id not in (call_meta.get('caller_id'), call_meta.get('callee_id')):
+                return
+            # Hanging up before the other side answered = cancelled; afterwards = ended.
+            await self._finish_call(
+                call_id, call_meta,
+                reason='hangup' if call_meta.get('connected_at') else 'cancelled',
             )
-
-            for uid in [call_meta['caller_id'], call_meta['callee_id']]:
-                await self.channel_layer.group_send(
-                    f'user_{uid}',
-                    {
-                        'type': 'call_ended_signal',
-                        'call_id': call_id,
-                        'duration_seconds': duration_seconds,
-                    }
-                )
 
         # ── legacy call signals (kept for backward compatibility) ──────────
 
@@ -942,37 +936,84 @@ class NotificationConsumer(AsyncWebsocketConsumer):
         await asyncio.sleep(timeout_secs)
         raw = await _cache_get(f'call:{call_id}')
         if not raw:
-            return  # Already answered or declined
+            return  # Already ended / declined
 
         call_meta = json.loads(raw)
-        if call_meta.get('started_at'):
-            return  # Call was answered
+        if call_meta.get('connected_at'):
+            # Call was answered — leave it alone.
+            # (Bug fixed: this used to check 'started_at', which answer never set,
+            #  so every answered call was killed after 30 seconds.)
+            return
 
-        await _cache_delete(f'call:{call_id}')
+        await self._finish_call(call_id, call_meta, reason='no_answer')
 
-        # Save no_answer call log
-        await _save_call_log(
-            call_id=call_id,
-            caller_username=call_meta.get('caller_username', ''),
-            receiver_username='Unknown', # we would need the callee username here, but it's close enough. To fix perfectly we could pass callee_username to timeout or in meta
-            mode=call_meta.get('mode', 'video'),
-            status='no_answer',
-            started_at=None,
-            ended_at=datetime.now(dt_tz.utc),
-            duration_seconds=0,
-            context_id=call_meta.get('context_id')
-        )
+    async def _finish_call(self, call_id, call_meta, reason):
+        """
+        End a call exactly once: clear state, write one CallLog, notify BOTH sides.
+        reason: 'hangup' (after answer) | 'cancelled' (caller gave up) |
+                'declined' | 'no_answer' | 'disconnected'
+        """
+        # Claim the call atomically — only the handler that deletes it logs it
+        if not await _cache_delete(f'call:{call_id}'):
+            return
+        for uid in (call_meta.get('caller_id'), call_meta.get('callee_id')):
+            if uid is None:
+                continue
+            current = await _cache_get(f'in_call_{uid}')
+            if current in (None, call_id):
+                await _cache_delete(f'in_call_{uid}')
 
-        # Notify caller that no one answered
-        await self.channel_layer.group_send(
-            f'user_{call_meta["caller_id"]}',
-            {
-                'type': 'call_ended_signal',
-                'call_id': call_id,
-                'reason': 'no_answer',
-                'duration_seconds': 0,
-            }
-        )
+        now = datetime.now(dt_tz.utc)
+        connected_at = call_meta.get('connected_at')
+        if connected_at:
+            started_at = datetime.fromisoformat(connected_at)
+            duration_seconds = max(0, int((now - started_at).total_seconds()))
+            status = 'ended'
+        else:
+            started_at = None
+            duration_seconds = 0
+            status = {'declined': 'declined', 'no_answer': 'no_answer'}.get(reason, 'cancelled')
+
+        try:
+            await _save_call_log(
+                call_id=call_id,
+                caller_username=call_meta.get('caller_username', ''),
+                receiver_username=call_meta.get('callee_username', ''),
+                mode=call_meta.get('mode', 'video'),
+                status=status,
+                started_at=started_at,
+                ended_at=now,
+                duration_seconds=duration_seconds,
+                context_id=call_meta.get('context_id'),
+            )
+        except Exception as e:
+            print(f"--- WEBRTC [finish_call] could not save call log: {e}")
+
+        for uid in (call_meta.get('caller_id'), call_meta.get('callee_id')):
+            if uid is None:
+                continue
+            await self.channel_layer.group_send(
+                f'user_{uid}',
+                {
+                    'type': 'call_declined_signal' if status == 'declined' else 'call_ended_signal',
+                    'call_id': call_id,
+                    'reason': reason,
+                    'duration_seconds': duration_seconds,
+                }
+            )
+
+    async def _end_call_if_still_gone(self, call_id, grace_secs=15):
+        """If a participant's socket drops mid-call and they don't come back
+        within the grace period, end the call (otherwise both users stayed
+        'busy' for 2 hours)."""
+        await asyncio.sleep(grace_secs)
+        if await _cache_get(f'user_online_{self.user.id}'):
+            return  # reconnected
+        raw = await _cache_get(f'call:{call_id}')
+        if raw:
+            await self._finish_call(call_id, json.loads(raw), reason='disconnected')
+        else:
+            await _cache_delete(f'in_call_{self.user.id}')
 
     # ── group-send handler methods ─────────────────────────────────────────
 

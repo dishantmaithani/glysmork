@@ -206,8 +206,10 @@ class JoinMatchmakingView(APIView):
                 # Identify the partner from the room name
                 partner_username = None
                 if room_name_signal and room_name_signal.startswith('direct_'):
-                    parts_room = room_name_signal.replace('direct_', '').split('_')
-                    partner_username = parts_room[1] if parts_room[0] == user.username else parts_room[0]
+                    # Use the real room members (name parsing broke for usernames with "_")
+                    sig_room = Room.objects.filter(name=room_name_signal).first()
+                    partner = sig_room.users.exclude(id=user.id).first() if sig_room else None
+                    partner_username = partner.username if partner else None
 
                 # Clear the signal
                 user.profile.current_intent = ''
