@@ -117,6 +117,8 @@ export default function NotificationProvider({ children }: { children: React.Rea
         }
 
         const wsBase = getWsBase();
+        // Notifications already toasted (shared by the live socket and the polling fallback)
+        const seen = loadSeen();
         let closedByUs = false;            // set on unmount: don't reconnect after an intentional close
         let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
         let retryDelay = 2000;             // exponential backoff, capped below
@@ -165,6 +167,11 @@ export default function NotificationProvider({ children }: { children: React.Rea
                     } else if (data.type === 'call_ended') {
                         window.dispatchEvent(new CustomEvent('sys_call_ended', { detail: data }));
                     } else if (data.type === 'friend_message' || data.type === 'session_message') {
+                        if (data.notif_key) {
+                            // The poll will see this same notification — don't toast it twice
+                            seen.add(data.notif_key);
+                            saveSeen(seen);
+                        }
                         if (data.sender && data.sender !== user.username) {
                             showToast(
                                 data.sender,
@@ -192,7 +199,6 @@ export default function NotificationProvider({ children }: { children: React.Rea
         connect();
 
         // FAILSAFE: Polling fallback for offline notifications
-        const seen = loadSeen();
         const poll = async () => {
             if (!user?.username) return;
             try {

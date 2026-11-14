@@ -484,8 +484,19 @@ class MessageListView(APIView):
         except Exception as e:
             pass  # Real-time push failed but message is saved — frontend will poll
 
+        # Let the other person know even if they don't have this chat open
+        # (toast + unread notification). Previously they got nothing.
+        if room_name.startswith('direct_'):
+            try:
+                from room.notify import notify_direct_message
+                notify_direct_message(requesting_user, room, msg, request.data.get('client_id'))
+            except Exception as e:
+                print(f"MessageListView: notify failed: {e}")
+
         return Response({
             "id": msg.id,
+            "client_id": request.data.get('client_id'),
+            "status": msg.status,
             "sender": msg.user.username,
             "text": msg.value,
             "isRead": msg.is_read,

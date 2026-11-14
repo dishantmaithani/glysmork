@@ -641,7 +641,8 @@ class FriendshipActionView(APIView):
                             sender=user,
                             receiver=target_user,
                             message=f'{user.username} wants to connect with you',
-                            room_name=f'direct_{user.username}_{target_user.username}'
+                            # sorted, so it matches the real room name and is cleared when read
+                            room_name='direct_' + '_'.join(sorted([user.username, target_user.username]))
                         )
                         
                         # Send real-time WebSocket signal to update UI instantly

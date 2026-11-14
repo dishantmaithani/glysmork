@@ -159,44 +159,9 @@ def _save_friend_message(sender, room_name, text):
 
     msg = Message.objects.create(user=sender, room=room, value=text)
 
-    # 3. Handle notifications for the recipient (partner)
-    partner = room.users.exclude(id=sender.id).only('id', 'username').first()
-
-    if partner:
-        from matchmaking.models import ChatNotification
-        from django.utils import timezone
-        
-        # Don't create duplicate unread notifications — just update the timestamp/message
-        notif, created_n = ChatNotification.objects.get_or_create(
-            sender=sender,
-            receiver=partner,
-            is_read=False,
-            defaults={'room_name': room_name, 'message': f'sent you a message!'}
-        )
-        if not created_n:
-            notif.created_at = timezone.now()
-            notif.message = f'sent you a message!'
-            notif.save()
-            
-        # Broadcast to global notification channel if peer is online
-        from channels.layers import get_channel_layer
-        from asgiref.sync import async_to_sync
-        layer = get_channel_layer()
-        if layer:
-            print(f"DEBUG: [_save_friend_message] Signal to user_{partner.id} for {partner.username}")
-            async_to_sync(layer.group_send)(
-                f'user_{partner.id}',
-                {
-                    'type': 'friend_message_recv',
-                    'conversation_id': room_name,
-                    'id': msg.id,
-                    'sender': sender.username,
-                    'text': text,
-                    'timestamp': msg.date.strftime('%I:%M %p'),
-                }
-            )
-        else:
-            print(f"DEBUG: [_save_friend_message] No channel layer found!")
+    # 3. Notify the recipient (same helper the REST send path uses)
+    from room.notify import notify_direct_message
+    notify_direct_message(sender, room, msg)
 
     return {
         'id': msg.id,
@@ -1057,6 +1022,7 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             'sender': event['sender'],
             'text': event['text'],
             'timestamp': event.get('timestamp'),
+            'notif_key': event.get('notif_key'),
         }))
 
     async def typing_indicator(self, event):

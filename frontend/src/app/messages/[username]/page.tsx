@@ -106,7 +106,12 @@ export default function DMPage() {
             setFriendStatus('none');
         }
 
+        // Coming back to this tab = you've now seen the messages
+        const onVisible = () => { if (document.visibilityState === 'visible') sendReadReceipt(); };
+        document.addEventListener('visibilitychange', onVisible);
+
         return () => {
+            document.removeEventListener('visibilitychange', onVisible);
             wsClosedByUsRef.current = true;
             if (wsReconnectTimerRef.current) clearTimeout(wsReconnectTimerRef.current);
             wsRef.current?.close();
@@ -126,9 +131,11 @@ export default function DMPage() {
                 sender: m.sender || m.sender_username,
                 text: m.text,
                 timestamp: m.date_iso ? new Date(m.date_iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : (m.date ? new Date(m.date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : m.timestamp),
-                status: m.is_read ? 'read' : 'sent',
-                isRead: m.is_read,
-                deletedForEveryone: m.deleted_for_everyone,
+                // The API sends `status` / `isRead` (not `is_read`) — reading the wrong field
+                // made every message show a single tick after a reload.
+                status: (m.status === 'read' || m.isRead || m.is_read) ? 'read' : (m.status === 'delivered' ? 'delivered' : 'sent'),
+                isRead: !!(m.status === 'read' || m.isRead || m.is_read),
+                deletedForEveryone: !!(m.deletedForEveryone ?? m.deleted_for_everyone),
                 is_ephemeral: m.is_ephemeral,
                 is_call_log: m.is_call_log,
                 call_mode: m.call_mode,
@@ -216,6 +223,10 @@ export default function DMPage() {
             wsRetryDelayRef.current = 2000;
             // Catch up on anything sent while we were disconnected
             if (wasReconnect) loadMessages();
+            // Tell the sender we've seen their messages. (Before, the receipt was only sent
+            // right after the history loaded — usually before this socket was open — so it
+            // was silently dropped and the sender never got the double tick.)
+            sendReadReceipt();
         };
 
         // Before: no reconnect at all, so after any network blip or server restart
@@ -256,8 +267,10 @@ export default function DMPage() {
                     }
                     return [...prev, newMsg];
                 });
-                // Send read receipt if it's from friend
-                if (data.username !== myUsername) {
+                // Send a read receipt for the friend's message — but only for the SAVED copy
+                // (it has a DB id). The instant socket copy arrives before the message is in
+                // the database, so acknowledging it marked nothing as read.
+                if ((data.username || data.sender) !== myUsername && data.id) {
                    sendReadReceipt();
                 }
             }
@@ -285,6 +298,8 @@ export default function DMPage() {
     };
 
     const sendReadReceipt = () => {
+        // Only count it as "read" if the conversation is actually on screen
+        if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
         if (wsRef.current?.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({
                 type: 'read_receipt',
@@ -339,10 +354,17 @@ export default function DMPage() {
         }
 
         try {
-            await fetchApi(`/room/${roomName}/messages/`, {
+            const saved = await fetchApi(`/room/${roomName}/messages/`, {
                 method: 'POST',
                 body: JSON.stringify({ username: myUsername, text, client_id: clientId }),
             });
+            // Swap the temporary id for the real one (needed for delete + read ticks),
+            // without downgrading a tick that a read receipt already set.
+            if (saved?.id) {
+                setMessages(prev => prev.map(m => m.client_id === clientId
+                    ? { ...m, id: saved.id, status: m.status === 'read' ? 'read' : (saved.status === 'read' ? 'read' : m.status) }
+                    : m));
+            }
         } catch { /* optimistic handling */ }
         finally { setSending(false); }
     };
