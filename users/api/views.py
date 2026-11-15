@@ -165,23 +165,49 @@ class AIOnboardingQuizView(APIView):
                 }}
                 Return ONLY the JSON. No markdown, no preamble.
                 """
+                def _parse(text):
+                    text = (text or '').replace("```json", "").replace("```", "").strip()
+                    if not text.startswith('{') and '{' in text and '}' in text:
+                        text = text[text.index('{'): text.rindex('}') + 1]
+                    data = json.loads(text)
+                    if not isinstance(data, dict) or not data.get("psychological_profile"):
+                        raise ValueError("analysis missing psychological_profile")
+                    return data
+
                 try:
-                    response_text = groq_generate(prompt)
-                    response_text = response_text.replace("```json", "").replace("```", "").strip()
-                    analysis = json.loads(response_text)
+                    analysis = None
+                    raw = ''
+                    # 2 attempts: the reasoning model occasionally answers with prose / a
+                    # refusal instead of JSON; a plain "JSON only" retry fixes that.
+                    for attempt in range(2):
+                        try:
+                            if attempt == 0:
+                                raw = groq_generate(prompt)
+                            else:
+                                raw = groq_generate(
+                                    prompt,
+                                    system="You are a helpful assistant that summarises a user's own self-description "
+                                           "for their profile. Reply with a single valid JSON object only.",
+                                    temperature=0.3,
+                                )
+                            analysis = _parse(raw)
+                            break
+                        except Exception as parse_err:
+                            print(f"Quiz analysis attempt {attempt + 1} unusable: {parse_err}; "
+                                  f"reply started with: {str(raw)[:80]!r}")
+                            if attempt == 1:
+                                raise
                 except Exception as e:
-                    print(f"Groq Analysis Error: {e}. Using mock fallback.")
-                    analysis = {
-                        "psychological_profile": {
-                            "core_traits": ["Analytical", "Observant", "Independent"],
-                            "attachment_style": "Secure-Leaning",
-                            "communication_style": "Direct and Logical",
-                            "deep_analysis": "This individual displays a high degree of self-awareness and prioritizes authenticity in their connections."
-                        },
-                        "extracted_interests": ["Tech", "Philosophy", "Discovery"],
-                        "extracted_expertise": ["Logic"],
-                        "image_prompt_for_persona": "An intricate glass-like neural network, glowing with cyan pulses against a dark matte background, clean minimalist aesthetics."
-                    }
+                    # Before: a canned "Analytical / Observant / Independent" profile with
+                    # interests "Tech, Philosophy, Discovery" was SAVED as if it were real
+                    # (and used up a weekly attempt) — those users then got meaningless
+                    # search and Persona matches. Now: save nothing, ask to retry.
+                    print(f"Groq Analysis Error: {e}. Not saving a fake profile.")
+                    return Response(
+                        {"error": "Our analysis service is busy right now. Please try again in a minute — "
+                                  "this attempt was not counted."},
+                        status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    )
                 
                 # Generate actual image URL via Pollinations
                 import urllib.parse

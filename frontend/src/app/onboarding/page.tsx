@@ -189,19 +189,31 @@ export default function OnboardingChat() {
                     }
                 });
 
-                try {
-                    await fetchApi(`/users/onboarding/analyze/`, {
-                        method: 'POST',
-                        body: JSON.stringify({
-                            username: username,
-                            answers: conversationAnswers,
-                            connection_preferences: {},
-                            interests: [],
-                            expertise: []
-                        })
-                    });
-                } catch (analyzeErr) {
-                    console.error('Django profile analysis failed:', analyzeErr);
+                // The analysis can be briefly unavailable (AI rate limits). The server no
+                // longer saves a fake profile in that case, so retry a few times and tell
+                // the user if it still didn't work.
+                let analyzed = false;
+                for (let attempt = 0; attempt < 3 && !analyzed; attempt++) {
+                    try {
+                        await fetchApi(`/users/onboarding/analyze/`, {
+                            method: 'POST',
+                            body: JSON.stringify({
+                                answers: conversationAnswers,
+                                connection_preferences: {},
+                                interests: [],
+                                expertise: []
+                            })
+                        });
+                        analyzed = true;
+                    } catch (analyzeErr: any) {
+                        console.error('Django profile analysis failed:', analyzeErr);
+                        const msg = String(analyzeErr?.message || '');
+                        if (msg.includes('twice a week')) break;   // weekly limit: retrying won't help
+                        if (attempt < 2) await new Promise(r => setTimeout(r, 6000));
+                    }
+                }
+                if (!analyzed) {
+                    alert("We couldn't finish analysing your answers right now. You can retake the profile quiz from your profile page in a minute — this attempt wasn't counted.");
                 }
             }
 

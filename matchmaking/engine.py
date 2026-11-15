@@ -52,6 +52,22 @@ would should will just really very also some any new
 """.split())
 
 
+# Generic role words: "Python developer" should keyword-match "Python programming".
+_ROLE_WORDS = set("""
+developer developers dev devs engineer engineers programmer programmers coder coders
+expert experts specialist specialists enthusiast enthusiasts fan fans lover lovers
+professional professionals pro guy guys girl girls person people someone somebody
+practitioner practitioners
+""".split())
+
+
+def _core_terms(text):
+    """Text with filler + generic role words removed ("Python developer" -> "python")."""
+    words = re.findall(r"[a-z0-9+#']+", (text or '').lower())
+    kept = [w for w in words if w not in _FILLER and w not in _ROLE_WORDS]
+    return ' '.join(kept)
+
+
 def _strip_filler(text):
     words = re.findall(r"[a-z0-9+#']+", (text or '').lower())
     kept = [w for w in words if w not in _FILLER]
@@ -231,13 +247,42 @@ def parse_intent_to_ast(intent_string):
         return ast
     except Exception as e:
         print(f"AST Parsing Error: {e}")
-        return {
-            "operator": "LEAF",
-            "type": "vector_concept",
-            "field": "any",
-            "value": intent_string,
-            "sentiment": "like",
-        }
+        return fallback_parse(intent_string)
+
+
+def fallback_parse(intent_string):
+    """
+    Rule-based query parsing used when the AI parser is unavailable (rate limit, outage).
+    Before, the whole sentence became ONE concept, which badly matched multi-part searches.
+      "Python developer who knows system design" -> AND("Python developer", "system design")
+      "cooking but not bread or baking"          -> AND("cooking", NOT "bread", NOT "baking")
+    """
+    text = (intent_string or '').strip()
+    low = text.lower()
+    neg_split = re.split(r"\b(?:but not|and not|except|excluding|without|not)\b", low, maxsplit=1)
+    wanted_text = neg_split[0]
+    unwanted_text = neg_split[1] if len(neg_split) > 1 else ''
+
+    def parts(s):
+        chunks = re.split(r"\b(?:and|or|who|with|plus|that|also|but)\b|[,;/&+]", s)
+        out = []
+        for c in chunks:
+            c = _strip_filler(c)
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    def leaf(v, sentiment='like'):
+        return {"operator": "LEAF", "type": "vector_concept", "field": "any", "value": v, "sentiment": sentiment}
+
+    wanted = parts(wanted_text)
+    unwanted = parts(unwanted_text)
+    nodes = [leaf(v) for v in wanted] + [leaf(v, 'hate') for v in unwanted]
+    if not nodes:
+        return leaf(text)
+    if len(nodes) == 1:
+        return nodes[0]
+    return {"operator": "AND", "operands": nodes}
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +331,15 @@ class MatchEvaluator:
         else:
             items = interests + expertise
         if not semantic_only:
+            core = _core_terms(val)
             for item in items:
                 if _word_match(item, val) or _word_match(val, item):
                     MATCH_STATS["fallback_keyword_used"] += 1
                     return 1.0
+                # "Python developer" vs "Python programming": compare without role words
+                if core and core != val.lower() and (_word_match(core, item) or _word_match(_core_terms(item), core)):
+                    MATCH_STATS["fallback_keyword_used"] += 1
+                    return 0.9
             if _word_match(val, bio):
                 MATCH_STATS["fallback_keyword_used"] += 1
                 return 0.8
@@ -323,6 +373,18 @@ class MatchEvaluator:
         value = node.get("value")
         field = node.get("field", "any")
         sentiment = (node.get("sentiment") or "like").lower()
+        # Exclusions ("NOT baking", "hates X") apply wherever it shows up in the profile.
+        # (The AI sometimes tags them as "expertise" while the person lists it under
+        #  interests, and the excluded person slipped through.)
+        negating = getattr(self, '_negating', 0)
+        if sentiment == 'hate' or negating:
+            field = 'any'
+            if node_type == 'exact_match':
+                node_type = 'vector_concept'  # keyword + meaning, across interests/expertise
+        if negating and sentiment == 'hate':
+            # The AI sometimes writes NOT(hate "bread"). That's ONE exclusion, not a double
+            # negative — otherwise the two cancel out and the excluded person is shown.
+            sentiment = 'like'
 
         if node_type == "exact_match":
             v = str(value or '')
@@ -359,7 +421,11 @@ class MatchEvaluator:
             child = node.get("operand") or (node.get("operands") or [{}])[0]
             # Don't list excluded things as "matched on"
             saved = list(self.matched_terms)
-            child_score = self.evaluate_node(child, profile)
+            self._negating = getattr(self, '_negating', 0) + 1
+            try:
+                child_score = self.evaluate_node(child, profile)
+            finally:
+                self._negating -= 1
             self.matched_terms = saved
             return 1.0 - child_score
 
