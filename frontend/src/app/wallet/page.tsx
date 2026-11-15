@@ -115,7 +115,7 @@ export default function WalletPage() {
                 <div className="text-center space-y-4">
                     <h1 className="text-4xl md:text-5xl font-black text-slate-900 tracking-tight">Upgrade Your Connection Engine</h1>
                     <p className="text-slate-500 max-w-xl mx-auto text-sm md:text-base font-medium">
-                        Free accounts get <strong className="text-slate-800">4 AI Searches</strong> and <strong className="text-slate-800">20 Roulette Matches</strong> per day. Subscribing gives you up to 100 searches and unlimited Roulette matching.
+                        Everyone gets <strong className="text-slate-800">50 Smart Searches</strong> per day and <strong className="text-slate-800">unlimited Roulette Matches</strong>. Subscribing raises Profile Matches to 100 per day.
                     </p>
                 </div>
 

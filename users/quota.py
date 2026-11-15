@@ -10,9 +10,11 @@ counter the dashboard never displayed.
 from django.utils import timezone
 
 # None = unlimited
+# Temporary (Nov 2026): 50 Smart Searches/day for everyone and unlimited Roulette.
+# Previous values: free ai=4, roulette=20; premium ai=40.
 LIMITS = {
-    'free':    {'ai': 4,  'standard': 4,   'roulette': 20},
-    'premium': {'ai': 40, 'standard': 100, 'roulette': None},
+    'free':    {'ai': 50, 'standard': 4,   'roulette': None},
+    'premium': {'ai': 50, 'standard': 100, 'roulette': None},
 }
 
 FIELDS = {
