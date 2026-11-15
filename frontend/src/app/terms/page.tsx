@@ -16,7 +16,7 @@ export default function TermsOfService() {
                 </div>
 
                 <h1 className="text-4xl font-bold text-slate-900 mb-2">Terms of Service</h1>
-                <p className="text-sm text-slate-400 mb-10 font-sans text-[13px] font-medium">Last updated: April 13, 2026</p>
+                <p className="text-sm text-slate-400 mb-10 font-sans text-[13px] font-medium">Last updated: November 15, 2026</p>
 
                 <div className="space-y-8 leading-relaxed text-sm text-slate-600">
                     <section>
@@ -42,9 +42,11 @@ export default function TermsOfService() {
                         <h2 className="text-xl font-semibold text-slate-900 mb-3">4. Free Usage Limits &amp; Quotas</h2>
                         <p className="mb-3">Free accounts are subject to the following daily usage limits, which reset at midnight UTC:</p>
                         <ul className="list-disc ml-6 space-y-2">
-                            <li><strong className="text-slate-800">AI/Intent-based Search:</strong> Up to 4 searches per day (combined). This limit applies to all searches that involve calling an external AI/LLM service, including onboarding-profile-aware searches.</li>
-                            <li><strong className="text-slate-800">Roulette Matching:</strong> Up to 20 random matches per day.</li>
+                            <li><strong className="text-slate-800">Smart Search (AI/Intent-based Search):</strong> Up to 50 searches per day. This limit applies to all searches that involve calling an external AI/LLM service, including onboarding-profile-aware searches and AI chat analysis.</li>
+                            <li><strong className="text-slate-800">Profile Match:</strong> Up to 4 matches per day based on your profile.</li>
+                            <li><strong className="text-slate-800">Roulette Matching:</strong> Unlimited.</li>
                             <li>Once a limit is reached, the feature will be unavailable until the daily quota resets, unless you upgrade to a subscription plan.</li>
+                            <li>We may change these limits from time to time. The limits currently in effect are always shown on your dashboard.</li>
                         </ul>
                     </section>
 
@@ -52,7 +54,7 @@ export default function TermsOfService() {
                         <h2 className="text-xl font-semibold text-slate-900 mb-3">5. Subscription Plans &amp; Billing</h2>
                         <p className="mb-3">Glysmork offers the following paid subscription tiers, providing extended daily limits:</p>
                         <ul className="list-disc ml-6 space-y-2">
-                            <li><strong className="text-slate-800">Subscribed tier limits:</strong> Up to 40 LLM-based AI searches per day; up to 100 standard (non-LLM) searches per day; unlimited Roulette matches.</li>
+                            <li><strong className="text-slate-800">Subscribed tier limits:</strong> Up to 50 Smart Searches (LLM-based) per day; up to 100 Profile Matches per day; unlimited Roulette matches.</li>
                             <li>Subscriptions are available on a Weekly, Monthly, 3-Month, 6-Month, or Yearly basis. Yearly pricing provides the greatest cost benefit.</li>
                             <li>Subscriptions are activated immediately upon successful payment and extend your existing subscription if one is already active.</li>
                             <li>All payments are processed securely via Razorpay. Glysmork does not store your payment card details.</li>
