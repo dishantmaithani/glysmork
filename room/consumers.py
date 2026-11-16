@@ -429,8 +429,18 @@ class NotificationConsumer(AsyncWebsocketConsumer):
             data = json.loads(text_data)
         except json.JSONDecodeError:
             return
+        if not isinstance(data, dict):
+            return
 
         msg_type = data.get('type')
+
+        # Session ids are server-made UUIDs. Anything else (e.g. "<id>:calls") would
+        # read a different cache key and crash this handler, so drop such messages.
+        if data.get('session_id') is not None:
+            try:
+                data['session_id'] = str(uuid.UUID(str(data['session_id'])))
+            except (ValueError, TypeError, AttributeError):
+                return
 
         # ── presence heartbeat ────────────────────────────────────────────
         if msg_type == 'ping':

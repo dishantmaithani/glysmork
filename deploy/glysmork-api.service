@@ -1,0 +1,26 @@
+# systemd unit for the Django/Channels API (replaces the single-process daphne.service).
+# Installed as /etc/systemd/system/glysmork-api.service.
+#
+# Several uvicorn worker processes share port 8000; live state (websocket groups,
+# call/chat sessions, cache) lives in Redis, so any worker can serve any request
+# and websockets on different workers still reach each other.
+# Workers: one per vCPU. Each takes ~130 MB of RAM.
+[Unit]
+Description=Glysmork API (uvicorn, multiple workers)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/glysmork
+EnvironmentFile=/home/ubuntu/glysmork/.env
+Environment=WEB_WORKERS=2
+ExecStart=/bin/sh -c 'exec /home/ubuntu/venv/bin/uvicorn chat.asgi:application --host 127.0.0.1 --port 8000 --workers $${WEB_WORKERS} --proxy-headers --forwarded-allow-ips 127.0.0.1 --no-server-header --timeout-graceful-shutdown 20'
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

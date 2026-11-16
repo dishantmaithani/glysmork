@@ -247,6 +247,12 @@ if DATABASES['default'].get('ENGINE', '').endswith('sqlite3'):
     # failing with "database is locked" under load (the server also runs SQLite in
     # WAL mode, so reads no longer block on writes).
     DATABASES['default'].setdefault('OPTIONS', {})['timeout'] = 20
+elif DATABASES['default'].get('ENGINE', '').endswith('postgresql'):
+    # Under ASGI (several uvicorn workers, each with a thread pool) persistent
+    # connections pile up per thread; Django recommends closing them per request.
+    # A local Postgres connect costs ~1-3 ms.
+    DATABASES['default']['CONN_MAX_AGE'] = int(os.environ.get('DB_CONN_MAX_AGE', '0'))
+    DATABASES['default']['CONN_HEALTH_CHECKS'] = True
 
 
 # Password validation
