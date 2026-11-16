@@ -223,7 +223,19 @@ export default function NotificationProvider({ children }: { children: React.Rea
             }
         };
 
-        const pollInterval = setInterval(poll, 4000);
+        // The live socket delivers notifications instantly. Polling is only a safety net:
+        // every 30 s while the socket is connected, every 5 s while it is down.
+        // (Before: every 4 s no matter what — the biggest source of server load per user.)
+        let lastPoll = 0;
+        const pollInterval = setInterval(() => {
+            const socketUp = wsRef.current?.readyState === WebSocket.OPEN;
+            const every = socketUp ? 30000 : 5000;
+            if (Date.now() - lastPoll >= every) {
+                lastPoll = Date.now();
+                poll();
+            }
+        }, 5000);
+        lastPoll = Date.now();
         poll();
 
         return () => {

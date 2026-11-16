@@ -74,7 +74,10 @@ export default function Dashboard() {
     const [profile, setProfile] = useState<any>(null);
 
     const [pollRef, setPollRef] = useState<ReturnType<typeof setInterval> | null>(null);
-    const { sendSignal } = useNotification();
+    const { sendSignal, onlineStatus } = useNotification();
+    // Live-socket status for the polling timers below (read via ref, not as an effect dependency)
+    const socketOnlineRef = useRef(onlineStatus);
+    socketOnlineRef.current = onlineStatus;
     const { startCall, endCall, callState } = useCall();
     const [onlineCount, setOnlineCount] = useState<number>(0);
     const [totalUsers, setTotalUsers] = useState<number>(0);
@@ -178,42 +181,32 @@ export default function Dashboard() {
                 setOnlineCount(data.online_count);
                 setTotalUsers(data.total_users);
             } catch (err: any) {
+                // (fetchApi already sends you to /login on 401. Before, ANY 404 here logged you out.)
                 console.error("Online count fetch failed:", err);
-                if (err?.message?.includes('404') || err?.message?.includes('401')) {
-                    handleLogout();
-                }
             }
-            // Send heartbeat to keep this user's last_seen fresh
+            // Heartbeat only when the live socket is down — while it's connected, its 30 s
+            // ping already keeps last_seen fresh on the server.
             const u = getUsername();
-            if (u) {
+            if (u && !socketOnlineRef.current) {
                 try {
-                    await fetchApi('/users/heartbeat/', {
-                        method: 'POST',
-                        body: JSON.stringify({ username: u }),
-                    });
+                    await fetchApi('/users/heartbeat/', { method: 'POST', body: JSON.stringify({}) });
                 } catch (err: any) {
-                    console.error("Heartbeat failed for user", u, err);
-                    if (err?.message?.includes('404') || err?.message?.includes('401')) {
-                        handleLogout();
-                    }
+                    console.error("Heartbeat failed", err);
                 }
             }
         };
         fetchOnline();
-        const onlineInterval = setInterval(fetchOnline, 15000);
+        const onlineInterval = setInterval(fetchOnline, 30000);
 
         const fetchNotifs = async () => {
             const u = getUsername();
             if (!u) return;
             try {
-                // Fetch friends list to check if sender is already a friend
-                const friendData = await fetchApi(`/matchmaking/friends/?username=${encodeURIComponent(u)}`).catch(() => ({ friends: [], sent: [], received: [] }));
-
-                const data = await fetchApi(`/matchmaking/notifications/?username=${encodeURIComponent(u)}`);
+                const data = await fetchApi(`/matchmaking/notifications/`);
                 if (data.notifications?.length > 0) {
                     const shownIds = JSON.parse(sessionStorage.getItem('shownDashboardNotifs') || '[]');
                     const unshown = data.notifications.filter((n: any) => !shownIds.includes(n.id));
-                    
+
                     if (unshown.length > 0) {
                             const now = new Date().getTime();
                             const freshNotifs = unshown.filter((n: any) => {
@@ -222,6 +215,9 @@ export default function Dashboard() {
                             });
 
                             if (freshNotifs.length > 0) {
+                                // Friends list only when there's something to label
+                                // (before: fetched on every poll, even with nothing new)
+                                const friendData = await fetchApi(`/matchmaking/friends/`).catch(() => ({ friends: [], sent: [], received: [] }));
                                 // Annotate fresh notifs with friendship status
                                 const annotated = freshNotifs.map((n: any) => {
                                     const isFriend = friendData.friends?.some((f: any) => (f.username === n.sender || f === n.sender));
@@ -242,13 +238,12 @@ export default function Dashboard() {
                         }
                     }
             } catch (err: any) {
-                if (err?.message?.includes('404') || err?.message?.includes('401')) {
-                    handleLogout();
-                }
+                console.error("Notification fetch failed", err);
             }
         };
         fetchNotifs();
-        const notifInterval = setInterval(fetchNotifs, 5000);
+        // every 15 s (was 5 s); new messages also arrive instantly over the live socket
+        const notifInterval = setInterval(fetchNotifs, 15000);
 
 
 

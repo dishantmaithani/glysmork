@@ -593,13 +593,20 @@ class OnlineCountView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        # Before: loaded EVERY profile and checked them one by one in Python on every call
+        # (2.4 s per call at 20k users), and every dashboard calls this repeatedly.
+        # Now: two COUNT queries, cached for 10 s and shared by all users.
         from django.contrib.auth.models import User
-        profiles = Profile.objects.select_related('user').all()
-        online = sum(1 for p in profiles if p.is_online())
-        return Response({
-            "online_count": online,
-            "total_users": User.objects.count(),
-        })
+        from django.core.cache import cache
+        data = cache.get('online_count_v2')
+        if data is None:
+            cutoff = timezone.now() - timedelta(minutes=1)   # same window as Profile.is_online()
+            data = {
+                "online_count": Profile.objects.filter(last_seen__gte=cutoff).count(),
+                "total_users": User.objects.count(),
+            }
+            cache.set('online_count_v2', data, 10)
+        return Response(data)
 
 
 class HeartbeatView(APIView):

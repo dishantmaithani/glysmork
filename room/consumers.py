@@ -370,6 +370,15 @@ class NotificationConsumer(AsyncWebsocketConsumer):
 
         # Mark user online — 60 s heartbeat TTL
         await _cache_set(f'user_online_{self.user.id}', True, timeout=60)
+
+        # Also stamp last_seen now (the online counter counts last_seen, and the 30 s
+        # socket ping keeps it fresh — so the dashboard no longer needs its own heartbeat)
+        @sync_to_async
+        def _stamp_last_seen():
+            from django.utils import timezone
+            from users.models import Profile
+            Profile.objects.filter(user_id=self.user.id).update(last_seen=timezone.now())
+        await _stamp_last_seen()
         # Store username → id mapping (useful for call routing)
         await _cache_set(f'uid_{self.user.username}', self.user.id, timeout=86400)
 

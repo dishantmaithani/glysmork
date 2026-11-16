@@ -187,7 +187,16 @@ export default function ChatRoom() {
     useEffect(() => {
         if (!roomId || !currentUser) return;
         fetchAndMergeMessages(roomId, currentUser);
-        const pollInterval = setInterval(() => fetchAndMergeMessages(roomId, currentUser), 3000);
+        // Messages arrive instantly over the socket; polling is only a safety net:
+        // every 15 s while the socket is open, every 3 s while it isn't (was always 3 s).
+        const socketOpen = () => wsRef.current?.readyState === WebSocket.OPEN;
+        let lastMsgPoll = Date.now();
+        const pollInterval = setInterval(() => {
+            if (Date.now() - lastMsgPoll >= (socketOpen() ? 15000 : 3000)) {
+                lastMsgPoll = Date.now();
+                fetchAndMergeMessages(roomId, currentUser);
+            }
+        }, 3000);
 
         try {
             const token = localStorage.getItem('access_token');
@@ -240,8 +249,12 @@ export default function ChatRoom() {
             console.log("WebSocket failed", e);
         }
 
-        // Separate status check every 5s (doesn't touch message state)
+        // Room-closed check (the partner leaving also arrives instantly over the socket):
+        // every 15 s while the socket is open, every 5 s while it isn't (was always 5 s).
+        let lastStatus = Date.now();
         const statusInt = setInterval(async () => {
+            if (Date.now() - lastStatus < (socketOpen() ? 15000 : 5000)) return;
+            lastStatus = Date.now();
             try {
                 const statusRes = await fetchApi(`/room/${roomId}/status/`);
                 if (statusRes.is_active === false && !roomId.startsWith('direct_')) {

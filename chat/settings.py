@@ -242,6 +242,11 @@ DATABASES = {
         conn_max_age=600
     )
 }
+if DATABASES['default'].get('ENGINE', '').endswith('sqlite3'):
+    # SQLite allows one writer at a time. Wait up to 20 s for the lock instead of
+    # failing with "database is locked" under load (the server also runs SQLite in
+    # WAL mode, so reads no longer block on writes).
+    DATABASES['default'].setdefault('OPTIONS', {})['timeout'] = 20
 
 
 # Password validation
